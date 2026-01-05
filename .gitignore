@@ -73,3 +73,6 @@ outputs/
 
 # Proxy
 proxy.sh
+
+# lm-evaluation-harness
+lm-evaluation-harness/
