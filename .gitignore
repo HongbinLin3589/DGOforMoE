@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# ????????????
+*.json
+*.parquet
+*.csv
+dgo_cache/
+*.log
+
+# ????????????
+*.bin
+*.safetensors
+*.pt
+*.pth
+models/
+checkpoints/
+
+# ????????????
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ??????
+.cache/
+*.cache
+
+# ??????
+logs/
+*.log
+
+# ????????????
+tmp/
+temp/
+.DS_Store
+
+# HuggingFace ??????
+huggingface_cache/
+.huggingface/
+
+# Proposal Docs
+Claude/
+Copilot/
+Gemini/
+backup/
+Docs/
+CLAUDE.md
+GEMINI.md
+
+# Checkpoints
+checkpoints/
+
+# Log
+eval_results/
+logs/
+outputs/
