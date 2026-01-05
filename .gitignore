@@ -70,3 +70,6 @@ checkpoints/
 eval_results/
 logs/
 outputs/
+
+# Proxy
+proxy.sh
