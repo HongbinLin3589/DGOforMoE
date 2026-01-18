@@ -4,5 +4,13 @@
 
 cd /usr/commondata/public/hf_hub/cc/DGO/scripts
 
-bash ./run_eval.sh /usr/commondata/public/hf_hub/cc/DGO/outputs/swift_grpo/olmoe_gsm8k/v0-20260104-073639/checkpoint-1000 gsm8k_cot 64
-bash ./run_eval.sh /usr/commondata/public/hf_hub/cc/DGO/outputs/swift_dgo/olmoe_gsm8k/v0-20260105-050617/checkpoint-1000 gsm8k_cot 64
+# Qwen
+# bash ./run_eval.sh /usr/commondata/public/hf_hub/cc/DGO/outputs/swift_sft/qwen_gsm8k/v2-20251228-233904/checkpoint-1000 gsm8k_cot 64
+# bash ./run_eval.sh /usr/commondata/public/hf_hub/cc/DGO/outputs/swift_dgo/qwen_gsm8k/v0-20260105-103318/checkpoint-1000 gsm8k_cot 64
+
+# DeepSeek
+# bash ./run_eval.sh /usr/commondata/public/hf_hub/cc/DGO/outputs/swift_dgo/deepseek_gsm8k/v0-20260105-151936/checkpoint-1000 gsm8k_cot 64
+
+# Mixtral
+bash ./run_eval.sh /usr/commondata/public/hf_hub/cc/DGO/outputs/swift_sft/mixtral_gsm8k/v0-20251229-201522/checkpoint-1000 gsm8k_cot 1
+bash ./run_eval.sh /usr/commondata/public/hf_hub/cc/DGO/outputs/swift_dgo/mixtral_gsm8k/v0-20260106-053721/checkpoint-1000 gsm8k_cot 1

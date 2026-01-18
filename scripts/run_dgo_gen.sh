@@ -183,7 +183,7 @@ python "${BASE_DIR}/vllm_inference.py" \
     --max_num_batched_tokens "$MAX_TOKENS_BATCH" \
     --swap_space "$SWAP_SPACE" \
     --output_file "$OUTPUT_FILE" \
-    --stop '### Human:' --stop '</answer>'
+    --stop $'\n### Human:' --stop '</answer>'
 
 echo ""
 echo "============================================================"

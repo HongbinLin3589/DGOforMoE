@@ -43,7 +43,7 @@ mkdir -p "${OUTPUT_BASE}" "${LOG_DIR}"
 
 # 数据集路径
 GSM8K_PATH="gsm8k"
-MATH_PATH="${BASE_DIR}/ReDit/dataset/MATH/data/train/0000.parquet"
+MATH_PATH="EleutherAI/hendrycks_math"
 MBPP_DATASET="mbpp"
 
 # =============================================================================
