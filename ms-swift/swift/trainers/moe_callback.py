@@ -461,8 +461,19 @@ class MoEMonitorCallback(TrainerCallback):
             return {}
 
     def _compute_load_cv(self) -> Tuple[float, Dict[int, float]]:
-        """计算负载变异系数"""
-        layer_cvs = {}
+        """计算负载变异系数
+
+        修复：先按层累积所有 batch 的 expert counts，再计算 CV
+
+        之前的 bug：每个 batch 单独算 CV 再平均，会导致 CV 被人为放大
+        例如：batch1 专家0负载高(CV=1.5)，batch2 专家1负载高(CV=1.5)
+              错误方法: avg_cv = 1.5
+              正确方法: 合并后均衡，cv = 0.2
+        """
+        from collections import defaultdict
+
+        # Step 1: 按层累积所有 batch 的 expert counts
+        layer_counts = defaultdict(lambda: torch.zeros(self.moe_config.num_experts))
 
         for logits, layer_idx in zip(self.router_logits_cache, self.layer_indices_cache):
             # logits: [N, num_experts]
@@ -475,54 +486,65 @@ class MoEMonitorCallback(TrainerCallback):
                 minlength=self.moe_config.num_experts
             ).float()
 
-            total = expert_counts.sum()
+            # ✅ 累积到同一层（而不是每个batch单独计算）
+            layer_counts[layer_idx] += expert_counts
+
+        # Step 2: 每层计算一次 CV
+        layer_cvs = {}
+        for layer_idx, counts in layer_counts.items():
+            total = counts.sum()
             if total == 0:
                 continue
 
-            load = expert_counts / total
-            mean_load = load.mean()
-            std_load = load.std()
-            cv = (std_load / (mean_load + 1e-8)).item()
+            load = counts / total
+            cv = (load.std() / (load.mean() + 1e-8)).item()
+            layer_cvs[layer_idx] = cv
 
-            if layer_idx not in layer_cvs:
-                layer_cvs[layer_idx] = []
-            layer_cvs[layer_idx].append(cv)
+        # Step 3: 返回所有层的平均 CV
+        avg_cv = sum(layer_cvs.values()) / len(layer_cvs) if layer_cvs else 0.0
 
-        # 计算每层平均 CV，再计算总平均
-        layer_avg_cvs = {k: sum(v)/len(v) for k, v in layer_cvs.items() if v}
-        avg_cv = sum(layer_avg_cvs.values()) / len(layer_avg_cvs) if layer_avg_cvs else 0.0
+        return avg_cv, layer_cvs
 
-        return avg_cv, layer_avg_cvs
-
-    def _compute_collapse_rate(self, threshold: float = 0.001) -> float:
+    def _compute_collapse_rate(self, threshold: float = 0.01) -> float:
         """计算路由崩溃率
 
         Args:
             threshold: 绝对阈值，负载 < threshold 的专家被认为"崩溃"
-                      默认 0.001 (0.1%)，即负载低于 0.1% 的专家算崩溃
-        """
-        all_counts = torch.zeros(self.moe_config.num_experts)
+                      默认 0.01 (1%)，即负载低于 1% 的专家算崩溃
 
-        for logits in self.router_logits_cache:
+        修复：按层累积后计算每层的崩溃率，返回最大值（最差情况）
+        之前的 bug：混合所有层，某层崩溃会被其他层掩盖
+        """
+        from collections import defaultdict
+
+        # Step 1: 按层累积 counts
+        layer_counts = defaultdict(lambda: torch.zeros(self.moe_config.num_experts))
+
+        for logits, layer_idx in zip(self.router_logits_cache, self.layer_indices_cache):
             topk_indices = torch.topk(logits, self.moe_config.topk, dim=-1).indices
             flat_indices = topk_indices.flatten()
 
-            layer_counts = torch.bincount(
+            expert_counts = torch.bincount(
                 flat_indices,
                 minlength=self.moe_config.num_experts
             ).float()
 
-            all_counts += layer_counts
+            layer_counts[layer_idx] += expert_counts
 
-        total = all_counts.sum()
-        if total == 0:
-            return 0.0
+        # Step 2: 每层计算崩溃率
+        layer_collapse_rates = []
+        for counts in layer_counts.values():
+            total = counts.sum()
+            if total == 0:
+                continue
 
-        load = all_counts / total
+            load = counts / total
+            collapsed = (load < threshold).sum().item()
+            collapse_rate = collapsed / self.moe_config.num_experts
+            layer_collapse_rates.append(collapse_rate)
 
-        # 使用绝对阈值：负载 < 0.1% 的专家被认为"崩溃"
-        collapsed = (load < threshold).sum().item()
-        return collapsed / self.moe_config.num_experts
+        # Step 3: 返回最大崩溃率（反映最差的层）
+        return max(layer_collapse_rates) if layer_collapse_rates else 0.0
 
     def _compute_routing_entropy(self) -> float:
         """
@@ -530,37 +552,44 @@ class MoEMonitorCallback(TrainerCallback):
 
         熵越高表示路由分布越均匀，越低表示越集中
         理想情况下: entropy = log(num_experts) 表示完全均匀
-        """
-        all_counts = torch.zeros(self.moe_config.num_experts)
 
-        for logits in self.router_logits_cache:
+        修复：按层累积后计算每层的熵，再取平均
+        之前的 bug：混合所有层，某层崩溃会被其他层掩盖
+        """
+        from collections import defaultdict
+
+        # Step 1: 按层累积 counts
+        layer_counts = defaultdict(lambda: torch.zeros(self.moe_config.num_experts))
+
+        for logits, layer_idx in zip(self.router_logits_cache, self.layer_indices_cache):
             topk_indices = torch.topk(logits, self.moe_config.topk, dim=-1).indices
             flat_indices = topk_indices.flatten()
 
-            layer_counts = torch.bincount(
+            expert_counts = torch.bincount(
                 flat_indices,
                 minlength=self.moe_config.num_experts
             ).float()
 
-            all_counts += layer_counts
+            layer_counts[layer_idx] += expert_counts
 
-        total = all_counts.sum()
-        if total == 0:
-            return 0.0
-
-        # 计算概率分布
-        probs = all_counts / total
-        # 过滤掉 0 值避免 log(0)
-        probs = probs[probs > 0]
-
-        # 计算熵: H = -sum(p * log(p))
-        entropy = -torch.sum(probs * torch.log(probs + 1e-10)).item()
-
-        # 归一化到 [0, 1]: 除以最大可能熵 log(num_experts)
+        # Step 2: 每层计算熵
         max_entropy = torch.log(torch.tensor(float(self.moe_config.num_experts))).item()
-        normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
+        layer_entropies = []
 
-        return normalized_entropy
+        for counts in layer_counts.values():
+            total = counts.sum()
+            if total == 0:
+                continue
+
+            probs = counts / total
+            probs = probs[probs > 0]
+
+            entropy = -torch.sum(probs * torch.log(probs + 1e-10)).item()
+            normalized = entropy / max_entropy if max_entropy > 0 else 0.0
+            layer_entropies.append(normalized)
+
+        # Step 3: 返回平均熵
+        return sum(layer_entropies) / len(layer_entropies) if layer_entropies else 0.0
 
     def _compute_max_load(self) -> float:
         """
@@ -569,26 +598,38 @@ class MoEMonitorCallback(TrainerCallback):
         表示最繁忙专家承担的 token 比例
         理想情况下: max_load = 1/num_experts (完全均衡)
         值越高表示负载越不均衡
-        """
-        all_counts = torch.zeros(self.moe_config.num_experts)
 
-        for logits in self.router_logits_cache:
+        修复：按层累积后计算每层的 max_load，返回最大值（最差情况）
+        之前的 bug：混合所有层后取 max，峰值被平滑了
+        """
+        from collections import defaultdict
+
+        # Step 1: 按层累积 counts
+        layer_counts = defaultdict(lambda: torch.zeros(self.moe_config.num_experts))
+
+        for logits, layer_idx in zip(self.router_logits_cache, self.layer_indices_cache):
             topk_indices = torch.topk(logits, self.moe_config.topk, dim=-1).indices
             flat_indices = topk_indices.flatten()
 
-            layer_counts = torch.bincount(
+            expert_counts = torch.bincount(
                 flat_indices,
                 minlength=self.moe_config.num_experts
             ).float()
 
-            all_counts += layer_counts
+            layer_counts[layer_idx] += expert_counts
 
-        total = all_counts.sum()
-        if total == 0:
-            return 0.0
+        # Step 2: 每层计算 max_load，取最大值（最差情况）
+        layer_max_loads = []
+        for counts in layer_counts.values():
+            total = counts.sum()
+            if total == 0:
+                continue
 
-        load = all_counts / total
-        return load.max().item()
+            load = counts / total
+            layer_max_loads.append(load.max().item())
+
+        # Step 3: 返回所有层中的最大值（反映最不均衡的层）
+        return max(layer_max_loads) if layer_max_loads else 0.0
 
     def on_log(
         self,

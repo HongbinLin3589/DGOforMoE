@@ -238,17 +238,20 @@ class MoEMonitor:
     def compute_collapse_rate(
         self,
         router_logits: Union[List[torch.Tensor], Tuple[torch.Tensor]],
-        threshold: float = 0.001
+        threshold: float = 0.01
     ) -> float:
         """
         计算路由崩溃率
 
         定义：负载 < 绝对阈值 的专家占比
 
+        修复：每层计算崩溃率，返回最大值（最差情况）
+        之前的 bug：混合所有层，某层崩溃会被其他层掩盖
+
         Args:
             router_logits: Router 输出
             threshold: 绝对阈值，负载 < threshold 的专家被认为"崩溃"
-                      默认 0.001 (0.1%)，即负载低于 0.1% 的专家算崩溃
+                      默认 0.01 (1%)，即负载低于 1% 的专家算崩溃
 
         Returns:
             崩溃率（0-1），越小越好
@@ -256,27 +259,28 @@ class MoEMonitor:
         if router_logits is None or len(router_logits) == 0:
             return 0.0
 
-        all_expert_counts = torch.zeros(self.num_experts)
+        layer_collapse_rates = []
 
         for layer_logits in router_logits:
             topk_indices = torch.topk(layer_logits, self.topk, dim=-1).indices  # [B, S, K]
 
-            # ✅ 向量化：使用 one_hot 替代循环
+            # 向量化：使用 one_hot 计数
             expert_mask = F.one_hot(topk_indices, num_classes=self.num_experts)  # [B, S, K, E]
-            all_expert_counts += expert_mask.sum(dim=(0, 1, 2))  # [E]
+            expert_counts = expert_mask.sum(dim=(0, 1, 2))  # [E]
 
-        total = all_expert_counts.sum()
-        if total == 0:
-            return 0.0
+            total = expert_counts.sum()
+            if total == 0:
+                continue
 
-        load = all_expert_counts / total
+            load = expert_counts.float() / total
 
-        # ✅ 使用绝对阈值：负载 < 0.1% 的专家被认为"崩溃"
-        # 与 moe_callback.py 保持一致
-        collapsed = (load < threshold).sum().item()
-        collapse_rate = collapsed / self.num_experts
+            # 计算该层的崩溃率
+            collapsed = (load < threshold).sum().item()
+            collapse_rate = collapsed / self.num_experts
+            layer_collapse_rates.append(collapse_rate)
 
-        return float(collapse_rate)
+        # 返回最大崩溃率（反映最差的层）
+        return max(layer_collapse_rates) if layer_collapse_rates else 0.0
 
     def compute_routing_kl(
         self,
