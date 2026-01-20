@@ -312,13 +312,25 @@ class RowPreprocessor:
                 'load_from_cache_file': load_from_cache_file,
             })
         # compat GRPO: The solution field will be retained.
+        # FIX: 也检查用户通过 origin_columns 映射创建的 solution 字段
         dataset = RowPreprocessor.get_features_dataset(dataset)
+        solution_source_field = None
         if 'solution' in dataset.features:
+            solution_source_field = 'solution'
+        else:
+            # 检查用户是否将某个字段映射到 solution (例如 columns={'answer': 'solution'})
+            columns_keys = {k.lower(): k for k in dataset.features.keys()}
+            for orig_field, mapped_field in self.origin_columns.items():
+                if mapped_field == 'solution' and orig_field.lower() in columns_keys:
+                    solution_source_field = columns_keys[orig_field.lower()]
+                    logger.info(f'GRPO: Found solution mapping: {solution_source_field} -> solution')
+                    break
+        if solution_source_field:
             with safe_ddp_context(None, True):
                 if isinstance(dataset, HfDataset) and not dataset.cache_files:
                     map_kwargs['cache_file_name'] = os.path.join(get_cache_dir(), 'datasets', 'map_cache',
                                                                  f'{dataset._fingerprint}.arrow')
-                dataset = dataset.map(lambda x: {'__#solution': x['solution']}, **map_kwargs)
+                dataset = dataset.map(lambda x: {'__#solution': x[solution_source_field]}, **map_kwargs)
                 map_kwargs.pop('cache_file_name', None)
         dataset = self.safe_rename_columns(dataset, self.origin_columns)
         dataset = self.safe_rename_columns(dataset, self.columns)
