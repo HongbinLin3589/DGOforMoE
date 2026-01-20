@@ -6,7 +6,7 @@
 """
 
 from typing import Dict, List, Tuple, Optional
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, concatenate_datasets
 import re
 
 
@@ -30,7 +30,16 @@ DATASET_CONFIGS = {
         "name": "MATH",
         "description": "MATH - 竞技数学问题 (5000题高中/大学数学题，与 lm-eval 一致)",
         "hf_name": "EleutherAI/hendrycks_math",  # lm-eval 标准
-        "hf_config": "all",
+        "hf_config": None,  # 将自动加载所有子集并合并
+        "hf_subsets": [  # MATH 有7个子集
+            "algebra",
+            "counting_and_probability",
+            "geometry",
+            "intermediate_algebra",
+            "number_theory",
+            "prealgebra",
+            "precalculus"
+        ],
         "question_field": "problem",
         "answer_field": "solution",
         "extract_answer_func": "extract_math_answer",
@@ -39,15 +48,18 @@ DATASET_CONFIGS = {
     },
     "mbpp": {
         "name": "MBPP",
-        "description": "MBPP - Mostly Basic Python Problems (974个编程问题，与 lm-eval 一致)",
+        "description": "MBPP - Mostly Basic Python Problems (full子集: train=374, test=500，与 lm-eval 一致)",
         "hf_name": "google-research-datasets/mbpp",  # lm-eval 标准
-        "hf_config": "full",                         # lm-eval 使用 full 版本
-        "question_field": "text",                    # 问题描述
-        "answer_field": "code",                      # 参考代码
+        "hf_config": "full",                         # lm-eval 使用 full 子集（train: 374条）
+        "question_field": "text",                    # 问题描述 (原始数据集)
+        "answer_field": "code",                      # 参考代码 (原始数据集)
         "test_field": "test_list",                   # 测试用例列表（新增）
         "extract_answer_func": "extract_mbpp_answer",
         "max_length": 2048,
         "supported_splits": ["train", "test", "validation", "prompt"],
+        # NOTE: MS-SWIFT training requires preprocessed dataset at:
+        # /usr/commondata/public/hf_hub/cc/DGO/datasets/mbpp_preprocessed
+        # Columns renamed: text->problem, code->solution (to match MS-SWIFT's ResponsePreprocessor)
     },
 }
 
@@ -144,20 +156,42 @@ class DatasetLoader:
         print(f">>> Split: {split}")
 
         # 从HuggingFace加载
-        if config['hf_config']:
+        hf_subsets = config.get('hf_subsets')
+
+        if hf_subsets:
+            # MATH等数据集需要加载多个子集并合并
+            print(f">>> 加载 {len(hf_subsets)} 个子集: {', '.join(hf_subsets)}")
+            subset_datasets = []
+            for subset in hf_subsets:
+                print(f"    - 加载子集: {subset}")
+                subset_ds = load_dataset(config['hf_name'], subset, split=split)
+                subset_datasets.append(subset_ds)
+
+            # 合并所有子集
+            data = concatenate_datasets(subset_datasets)
+            print(f">>> 合并完成，共 {len(data)} 条数据")
+        elif config['hf_config']:
             dataset = load_dataset(config['hf_name'], config['hf_config'])
+            # 获取指定split
+            if split in dataset:
+                data = dataset[split]
+            else:
+                available_splits = list(dataset.keys())
+                raise ValueError(
+                    f"数据集 {dataset_name} 中不存在 split '{split}'\n"
+                    f"可用的 splits: {available_splits}"
+                )
         else:
             dataset = load_dataset(config['hf_name'])
-
-        # 获取指定split
-        if split in dataset:
-            data = dataset[split]
-        else:
-            available_splits = list(dataset.keys())
-            raise ValueError(
-                f"数据集 {dataset_name} 中不存在 split '{split}'\n"
-                f"可用的 splits: {available_splits}"
-            )
+            # 获取指定split
+            if split in dataset:
+                data = dataset[split]
+            else:
+                available_splits = list(dataset.keys())
+                raise ValueError(
+                    f"数据集 {dataset_name} 中不存在 split '{split}'\n"
+                    f"可用的 splits: {available_splits}"
+                )
 
         # 限制数据集大小
         if limit and limit > 0:
