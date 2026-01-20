@@ -22,6 +22,9 @@ from transformers import PreTrainedModel, Trainer
 from swift.plugin import orms
 from swift.trainers.mixin import SwiftMixin
 
+# Import trainers to apply OLMoE load_balancing_loss_func patch for DeepSpeed ZeRO compatibility
+from swift.trainers import trainers as _  # noqa: F401  # Trigger module-level patch execution
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +68,7 @@ class DGOTrainer(SwiftMixin, Trainer):
     def __init__(
         self,
         model: Optional[Union[PreTrainedModel, nn.Module]] = None,
+        ref_model: Optional[Union[PreTrainedModel, nn.Module]] = None,  # ✅ 添加 ref_model 参数（可选）
         reward_funcs: Optional[List[Union[str, Callable]]] = None,
         *_args,
         **kwargs,
@@ -74,6 +78,9 @@ class DGOTrainer(SwiftMixin, Trainer):
 
         Args:
             model: The model to train
+            ref_model: Reference model for MoE monitoring (optional).
+                      Typically the SFT model used for DGO data generation.
+                      If provided, enables routing_kl and saturation metrics.
             reward_funcs: List of reward function names (e.g., ['accuracy']) or callables
             **kwargs: Additional arguments passed to Trainer
         """
@@ -85,6 +92,9 @@ class DGOTrainer(SwiftMixin, Trainer):
         # Use max_length first, fallback to max_completion_length
         self.max_length = getattr(args, 'max_length', None) or getattr(args, 'max_completion_length', 1024)
         self.freeze_router = getattr(args, 'freeze_router', False)
+
+        # ✅ 保存 ref_model（可选，默认为 None，不影响训练）
+        self.ref_model = ref_model
 
         # Get tokenizer/processing_class from template (same as SwiftMixin)
         template = kwargs.get('template')
@@ -117,6 +127,10 @@ class DGOTrainer(SwiftMixin, Trainer):
         if self.freeze_router:
             self._freeze_router_params(model)
 
+        # Add MoE monitoring callback if enabled
+        if getattr(args, 'moe_monitor_enabled', False):
+            self._add_moe_monitor_callback()
+
     def _freeze_router_params(self, model: nn.Module):
         """
         Freeze all router/gate parameters for Group D experiments.
@@ -129,6 +143,42 @@ class DGOTrainer(SwiftMixin, Trainer):
                 frozen_count += 1
                 logger.debug(f"Froze router parameter: {name}")
         logger.info(f"Froze {frozen_count} router parameters (freeze_router=True)")
+
+    def _add_moe_monitor_callback(self):
+        """
+        Add MoE monitoring callback if enabled.
+
+        Note: If ref_model is provided, can log all 5 metrics including routing_kl and saturation.
+              If ref_model is None, can only log 3 basic metrics (load_cv, collapse_rate, switching_freq).
+        """
+        # Check if MoE monitoring is enabled
+        if not getattr(self.args, 'moe_monitor_enabled', False):
+            return
+
+        try:
+            from swift.trainers.moe_callback import MoEMonitorCallback
+
+            moe_callback = MoEMonitorCallback(
+                ref_model=self.ref_model,  # ✅ 使用 self.ref_model（可选）
+                log_every=getattr(self.args, 'moe_log_every', 100),
+                save_dir=getattr(self.args, 'moe_save_dir', None),
+                enabled=True
+            )
+            # ✅ FIX: 插入到callback列表开头，确保on_log在TensorBoard之前执行
+            self.callback_handler.callbacks.insert(0, moe_callback)
+
+            # ✅ 根据是否有 ref_model 打印不同的信息
+            if self.ref_model is not None:
+                logger.info("✅ MoE monitoring callback added to DGO trainer (with ref_model)")
+                logger.info("   Available metrics: load_cv, collapse_rate, switching_freq, routing_kl, saturation")
+            else:
+                logger.info("✅ MoE monitoring callback added to DGO trainer (without ref_model)")
+                logger.info("   Available metrics: load_cv, collapse_rate, switching_freq")
+                logger.info("   💡 Tip: Provide ref_model to DGOTrainer for routing_kl and saturation metrics")
+
+        except ImportError as e:
+            logger.warning(f"⚠️  Failed to import MoEMonitorCallback: {e}")
+            logger.warning("   MoE monitoring will be disabled. Make sure moe_monitor.py is in the project root.")
 
     def _prepare_rewards(self, reward_funcs: List[Union[str, Callable]]):
         """
