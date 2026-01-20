@@ -50,13 +50,17 @@ get_model_path() {
 }
 
 # =============================================================================
-# 项目目录结构（相对路径）
+# 项目目录结构
 # =============================================================================
 export DGO_SCRIPTS="${DGO_ROOT}/scripts"
-export DGO_OUTPUTS="${DGO_ROOT}/outputs"
-export DGO_LOGS="${DGO_ROOT}/logs"
 export DGO_DATASETS="${DGO_ROOT}/datasets"
-export DGO_CACHE="${DGO_ROOT}/dgo_cache"
+
+# 输出路径配置（可修改为其他磁盘以存储大文件）
+# 默认使用 /root/autodl-fs，可通过环境变量覆盖
+export DGO_STORAGE="${DGO_STORAGE:-/root/autodl-fs}"
+export DGO_OUTPUTS="${DGO_STORAGE}/outputs"
+export DGO_LOGS="${DGO_STORAGE}/logs"
+export DGO_CACHE="${DGO_STORAGE}/dgo_cache"
 
 # 输出子目录
 export SFT_OUTPUT="${DGO_OUTPUTS}/swift_sft"
