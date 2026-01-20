@@ -36,6 +36,9 @@ class TrainArgumentsMixin:
         logging_steps (int): Log every `logging_steps` global steps. Defaults to 5.
         router_aux_loss_coef (float): The coefficient for the router auxiliary loss in Mixture-of-Experts models.
             Defaults to 0.0.
+        moe_monitor_enabled (bool): Whether to enable MoE routing monitor callback for tracking expert load
+            distribution and routing collapse. Defaults to False.
+        moe_log_every (int): Log MoE metrics every N steps when moe_monitor_enabled is True. Defaults to 100.
         enable_dft_loss (bool): Whether to enable Diversity-from-Diversity (DFD) loss.
             See https://arxiv.org/abs/2508.05629. Defaults to False.
         enable_channel_loss (bool): Whether to enable channel loss. Defaults to False.
@@ -104,6 +107,10 @@ class TrainArgumentsMixin:
     logging_first_step: bool = True
     logging_steps: int = 5
     router_aux_loss_coef: float = 0.
+    # MoE monitoring parameters
+    moe_monitor_enabled: bool = False  # Whether to enable MoE routing monitor
+    moe_log_every: int = 100  # Log MoE metrics every N steps
+    moe_save_dir: Optional[str] = None  # Directory to save MoE metrics
     enable_dft_loss: bool = False  # https://arxiv.org/abs/2508.05629
     enable_channel_loss: bool = False
 
@@ -263,6 +270,8 @@ class SwiftArgumentsMixin(RLHFArgumentsMixin, TrainArgumentsMixin):
     galore_config: Optional[GaLoreConfig] = None
     task_type: Optional[str] = None
     problem_type: Optional[str] = None
+
+    # MoE Monitoring - inherited from TrainArgumentsMixin (no need to redefine)
 
     def __post_init__(self):
         if hasattr(self, 'output_dir'):
