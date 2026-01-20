@@ -1,9 +1,16 @@
 # =================================================================================
-# 配置HuggingFace缓存目录和镜像源（必须在所有导入之前）
+# vLLM Inference Script for DGO Data Generation
+# =================================================================================
+# 配置 HuggingFace 缓存目录和镜像源（必须在所有导入之前）
+# 优先使用环境变量，否则使用默认值
 # =================================================================================
 import os
-os.environ['HF_HOME'] = '/usr/storage/fwan/huggingface_cache'
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+# HuggingFace 配置（优先使用环境变量）
+if 'HF_HOME' not in os.environ:
+    os.environ['HF_HOME'] = '/usr/storage/fwan/huggingface_cache'
+if 'HF_ENDPOINT' not in os.environ:
+    os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 import argparse
 import json
@@ -19,8 +26,9 @@ from transformers import AutoTokenizer
 # =================================================================================
 
 # 添加 DGO 目录到 Python 路径
-sys.path.insert(0, str(Path(__file__).parent))
-from datasets_config import DatasetLoader, SYSTEM_PROMPTS, EXTRACT_ANSWER_FUNCS
+DGO_ROOT = Path(__file__).parent
+sys.path.insert(0, str(DGO_ROOT))
+from datasets_config import DatasetLoader, SYSTEM_PROMPTS, EXTRACT_ANSWER_FUNCS, DATASET_CONFIGS
 
 # =================================================================================
 # 数据集特定的 prompt 格式
@@ -45,7 +53,8 @@ FEW_SHOT_EXAMPLES = {
     },
     "math": {
         'question': 'What is the value of 2 + 2?',
-        'assistant': 'The answer is $2 + 2 = 4$. Therefore, the answer is \\boxed{4}.'
+        # 使用<answer>标签格式，与GSM8K保持一致
+        'assistant': '<thinking>\nWe need to compute 2 + 2.\nThis is a simple addition: 2 + 2 = 4.\n</thinking>\n<answer>\n\\boxed{4}\n</answer>'
     },
     "mbpp": {
         'question': 'Write a function to return the sum of two numbers.',
@@ -69,7 +78,7 @@ def extract_math_answer(text: str) -> str | None:
 
 def load_dataset_by_type(dataset_name: str, split: str = "train") -> Dataset:
     """
-    统一加载不同数据集。
+    统一加载不同数据集（使用 datasets_config.py 的 DatasetLoader）
 
     Args:
         dataset_name: 数据集名称 (gsm8k, math, mbpp)
@@ -78,47 +87,12 @@ def load_dataset_by_type(dataset_name: str, split: str = "train") -> Dataset:
     Returns:
         加载的数据集
     """
-    dataset_name_lower = dataset_name.lower()
-
-    if dataset_name_lower not in ["gsm8k", "math", "mbpp"]:
-        raise ValueError(f"不支持的数据集: {dataset_name_lower}. 支持: gsm8k, math, mbpp")
-
-    print(f">>> 加载数据集: {dataset_name_lower} (split={split})")
-
-    try:
-        if dataset_name_lower == "gsm8k":
-            # GSM8K 从本地 parquet 文件加载
-            file_path = f'/usr/commondata/public/hf_hub/cc/DGO/ReDit/dataset/gsm8k/main/{split}-00000-of-00001.parquet'
-            dataset = load_dataset('parquet', data_files=file_path)
-            actual_split = 'train' if 'train' in dataset else list(dataset.keys())[0]
-            data = dataset[actual_split]
-
-        elif dataset_name_lower == "math":
-            # MATH 从 HuggingFace 加载
-            dataset = load_dataset('hendrycks/math', 'all')
-            if split not in dataset:
-                print(f"警告: MATH 数据集中不存在 split '{split}', 使用 'train'")
-                split = 'train'
-            data = dataset[split]
-
-        elif dataset_name_lower == "mbpp":
-            # MBPP 从 HuggingFace 加载
-            dataset = load_dataset('mbpp')
-            if split not in dataset:
-                print(f"警告: MBPP 数据集中不存在 split '{split}', 使用 'train'")
-                split = 'train'
-            data = dataset[split]
-
-    except Exception as e:
-        print(f"❌ 加载数据集失败: {e}")
-        raise
-
-    print(f">>> 数据集加载成功，包含 {len(data)} 条数据")
-    return data
+    # 使用统一的 DatasetLoader（避免重复代码）
+    return DatasetLoader.load_dataset(dataset_name, split=split)
 
 def preprocess_dataset(dataset_name: str, data: Dataset, system_prompt: str = None) -> Dataset:
     """
-    预处理数据集为推理格式。
+    预处理数据集为推理格式（Base Model - 直接拼接文本，不使用chat template）
 
     Args:
         dataset_name: 数据集名称
@@ -133,49 +107,59 @@ def preprocess_dataset(dataset_name: str, data: Dataset, system_prompt: str = No
     if system_prompt is None:
         system_prompt = SYSTEM_PROMPTS_CUSTOM.get(dataset_name_lower, "You are a helpful assistant.")
 
-    print(f">>> 预处理数据集...")
+    print(f">>> 预处理数据集（Base Model模式：直接文本拼接）...")
 
     if dataset_name_lower == "gsm8k":
-        # GSM8K 格式处理
+        # GSM8K 格式处理 - 直接拼接few-shot文本
         def preprocess_gsm8k(x):
             example = FEW_SHOT_EXAMPLES["gsm8k"]
+            # 直接拼接文本，不使用chat template
+            prompt_text = f"""{system_prompt}
+
+Example:
+Q: {example['question']}
+A: {example['assistant']}
+
+Q: {x['question']}
+A:"""
             return {
-                'prompt': [
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': example['question']},
-                    {'role': 'assistant', 'content': example['assistant']},
-                    {'role': 'user', 'content': x['question']}
-                ],
+                'prompt': prompt_text,  # 直接返回字符串，不是chat格式
                 'answer': extract_hash_answer(x['answer'])
             }
         data = data.map(preprocess_gsm8k)
 
     elif dataset_name_lower == "math":
-        # MATH 格式处理
+        # MATH 格式处理 - 直接拼接few-shot文本
         def preprocess_math(x):
             example = FEW_SHOT_EXAMPLES["math"]
+            prompt_text = f"""{system_prompt}
+
+Example:
+Q: {example['question']}
+A: {example['assistant']}
+
+Q: {x['problem']}
+A:"""
             return {
-                'prompt': [
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': example['question']},
-                    {'role': 'assistant', 'content': example['assistant']},
-                    {'role': 'user', 'content': x['problem']}
-                ],
+                'prompt': prompt_text,
                 'answer': extract_math_answer(x['solution'])
             }
         data = data.map(preprocess_math)
 
     elif dataset_name_lower == "mbpp":
-        # MBPP 格式处理
+        # MBPP 格式处理 - 直接拼接few-shot文本
         def preprocess_mbpp(x):
             example = FEW_SHOT_EXAMPLES["mbpp"]
+            prompt_text = f"""{system_prompt}
+
+Example:
+Q: {example['question']}
+A: {example['assistant']}
+
+Q: {x['text']}
+A:"""
             return {
-                'prompt': [
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': example['question']},
-                    {'role': 'assistant', 'content': example['assistant']},
-                    {'role': 'user', 'content': x['text']}
-                ],
+                'prompt': prompt_text,
                 'answer': x['test_list']
             }
         data = data.map(preprocess_mbpp)
@@ -210,22 +194,6 @@ def main(args):
         swap_space=args.swap_space,  # CPU swap空间(GB)，用于更大batch
         dtype="bfloat16",  # 使用bf16节省显存
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-
-    # 为没有 chat_template 的 base model 设置默认模板
-    # 使用 ms-swift 的 "default" 模板格式，保持和 GRPO 一致
-    if tokenizer.chat_template is None:
-        print(">>> 模型没有chat_template，设置ms-swift default模板...")
-        tokenizer.chat_template = """{% if messages[0]['role'] == 'system' %}{{ messages[0]['content'] }}
-
-{% set messages = messages[1:] %}{% endif %}{% for message in messages %}{% if message['role'] == 'user' %}### Human:
-{{ message['content'] }}
-
-{% elif message['role'] == 'assistant' %}### Assistant:
-{{ message['content'] }}
-
-{% endif %}{% endfor %}{% if add_generation_prompt %}### Assistant:
-{% endif %}"""
 
     # 加载并预处理数据集
     print(f"正在加载数据集: {args.dataset}, split={args.dataset_split}")
@@ -237,9 +205,9 @@ def main(args):
         return
 
     # 准备 prompts
-    # 将聊天记录转换为单个字符串
-    print(f">>> 准备推理 prompts...")
-    prompts = [tokenizer.apply_chat_template(item['prompt'], tokenize=False, add_generation_prompt=True) for item in dataset]
+    # Base Model模式：直接使用预处理后的文本prompt，不应用chat template
+    print(f">>> 准备推理 prompts（Base Model模式：不使用chat template）...")
+    prompts = [item['prompt'] for item in dataset]  # 直接使用字符串prompt
     ground_truth_answers = [item['answer'] for item in dataset]
 
     # 配置采样参数
