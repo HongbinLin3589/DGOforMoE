@@ -24,8 +24,115 @@ from .utils import per_token_loss_func, per_token_loss_func_sp
 logger = get_logger()
 
 
+# =============================================================================
+# Monkey patch for OLMoE load_balancing_loss_func to fix Expert Parallelism bug
+# Issue: OLMoE's load_balancing_loss_func assumes expert parallelism (EP) where
+# each GPU has different experts. But with DeepSpeed ZeRO, all GPUs have all
+# experts. The device_index is wrongly used to compute expert shard offset.
+# Fix: Always use device_index=0 (no EP offset) when not using expert parallelism.
+# =============================================================================
+def _patch_olmoe_load_balancing_loss():
+    """Patch OLMoE load_balancing_loss_func to work with DeepSpeed ZeRO."""
+    try:
+        from transformers.models.olmoe import modeling_olmoe
+        from typing import Optional, Union
+
+        def load_balancing_loss_func_fixed(
+            gate_logits: Union[torch.Tensor, tuple, None],
+            num_experts: Optional[int] = None,
+            top_k=2,
+            attention_mask: Optional[torch.Tensor] = None,
+        ) -> Union[torch.Tensor, int]:
+            """Fixed version that doesn't assume expert parallelism."""
+            if gate_logits is None or not isinstance(gate_logits, tuple):
+                return 0
+
+            if isinstance(gate_logits, tuple):
+                compute_device = gate_logits[0].device
+                concatenated_gate_logits = torch.cat(
+                    [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
+                )
+
+            routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+            _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+            expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+
+            # Check if attention_mask is valid (not None, not empty, correct dimensions)
+            use_attention_mask = (
+                attention_mask is not None
+                and attention_mask.numel() > 0
+                and len(attention_mask.shape) == 2
+            )
+
+            if not use_attention_mask:
+                tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+                router_prob_per_expert = torch.mean(routing_weights, dim=0)
+            else:
+                try:
+                    batch_size, sequence_length = attention_mask.shape
+                    # Check if dimensions are compatible
+                    if batch_size * sequence_length == 0:
+                        raise ValueError("Empty attention_mask")
+
+                    num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+                    if num_hidden_layers == 0:
+                        raise ValueError("Invalid num_hidden_layers")
+
+                    expert_attention_mask = (
+                        attention_mask[None, :, :, None, None]
+                        .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
+                        .reshape(-1, top_k, num_experts)
+                        .to(compute_device)
+                    )
+
+                    tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
+                        expert_attention_mask, dim=0
+                    )
+                    # Compute router probabilities with attention mask
+                    router_per_expert_attention_mask = (
+                        attention_mask[None, :, :, None]
+                        .expand((num_hidden_layers, batch_size, sequence_length, routing_weights.shape[1]))
+                        .reshape(-1, routing_weights.shape[1])
+                        .to(compute_device)
+                    )
+
+                    router_prob_per_expert = torch.sum(
+                        routing_weights * router_per_expert_attention_mask, dim=0
+                    ) / torch.sum(router_per_expert_attention_mask, dim=0)
+                except (ValueError, RuntimeError) as e:
+                    # Fallback to simple mean if attention_mask computation fails
+                    tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+                    router_prob_per_expert = torch.mean(routing_weights, dim=0)
+                    use_attention_mask = False  # Skip the router calculation below
+
+            # FIX: Don't use device_index for expert shard offset with DeepSpeed ZeRO
+            # Original bug: rank = routing_weights.shape[1] * int(device_index)
+            # With ZeRO, all GPUs have all experts, so no offset needed
+            overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+            return overall_loss * num_experts
+
+        # Apply the patch
+        modeling_olmoe.load_balancing_loss_func = load_balancing_loss_func_fixed
+        logger.info('✅ Patched OLMoE load_balancing_loss_func for DeepSpeed ZeRO compatibility')
+    except ImportError:
+        pass  # OLMoE not available, no patch needed
+    except Exception as e:
+        logger.warning(f'⚠️  Failed to patch OLMoE load_balancing_loss_func: {e}')
+
+
+# Apply patch on module load
+_patch_olmoe_load_balancing_loss()
+
+
 class Trainer(SwiftMixin, DataLoaderMixin, HfTrainer):
     args: TrainingArguments
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Add MoE monitoring callback if enabled (method defined in SwiftMixin)
+        if getattr(self.args, 'moe_monitor_enabled', False):
+            self._add_moe_monitor_callback()
 
     def _prepare_inputs(self, inputs):
         inputs = super()._prepare_inputs(inputs)
@@ -240,6 +347,11 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_accepts_loss_kwargs = True  # fix transformers>=4.46.2
+
+        # Add MoE monitoring callback if enabled
+        if getattr(self.args, 'moe_monitor_enabled', False):
+            self._add_moe_monitor_callback()
+
         if self.args.predict_with_generate:
             from swift.llm import PtEngine
             self.infer_engine = PtEngine.from_model_template(

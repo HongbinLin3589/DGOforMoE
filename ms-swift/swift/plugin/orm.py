@@ -282,9 +282,16 @@ class MathAccuracy(ORM):
             'The math_verify package is required but not installed. '
             "Please install it using 'pip install math_verify'.")
 
-    def __call__(self, completions, solution, **kwargs) -> List[float]:
+    def __call__(self, completions, **kwargs) -> List[float]:
         from latex2sympy2_extended import NormalizationConfig
         from math_verify import LatexExtractionConfig, parse, verify
+
+        # Extract solution from kwargs (passed by GRPO trainer via rows_to_batched)
+        solution = kwargs.get('solution')
+        if solution is None:
+            raise ValueError("MathAccuracy requires 'solution' field in the dataset. "
+                           "Make sure your dataset has a 'solution' column or use --columns to map it.")
+
         rewards = []
         for content, sol in zip(completions, solution):
             content_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
@@ -327,6 +334,178 @@ class MathAccuracy(ORM):
         return rewards
 
 
+class MBPPCodeExecution(ORM):
+    """
+    MBPP Code Execution Reward - 使用 HuggingFace Evaluate code_eval (与 lm-eval 一致)
+
+    与 lm-evaluation-harness 完全一致的代码执行验证
+    """
+
+    def __init__(self):
+        import importlib.util
+        assert importlib.util.find_spec('evaluate') is not None, (
+            'The evaluate package is required but not installed. '
+            "Please install it using 'pip install evaluate'")
+
+        try:
+            import evaluate as hf_evaluate
+            self.code_eval = hf_evaluate.load("code_eval")
+            self.has_code_eval = True
+        except Exception as e:
+            raise RuntimeError(f"Failed to load code_eval metric: {e}")
+
+    @staticmethod
+    def extract_code_blocks(text: str) -> str:
+        """从文本中提取 Markdown 代码块（与 lm-eval 完全一致 + 增强回退）
+
+        lm-eval 参考: lm-evaluation-harness/lm_eval/tasks/mbpp/utils.py
+        """
+        # === lm-eval 兼容逻辑（优先）===
+        # 使用与 lm-eval 完全一致的模式: (?:\w+)? 匹配任何语言标记
+        pattern = r"```(?:\w+)?\n?(.*?)\n?```"
+
+        # 1. 先尝试直接匹配（处理已有```的情况）
+        matches = re.findall(pattern, text, re.DOTALL)
+
+        # 2. 如果失败，添加前缀再匹配（处理gen_prefix情况）
+        if not matches:
+            matches = re.findall(pattern, r"```" + text, re.DOTALL)
+
+        # 3. 过滤空字符串并返回最后一个非空匹配
+        matches = [m for m in matches if m and m.strip()]
+        if matches:
+            return matches[-1].strip()  # 返回最后一个非空匹配
+
+        # === 增强回退（仅当 lm-eval 逻辑失败时）===
+        # Fallback 1: 检查是否是纯代码（以 def/class 开头）
+        text_stripped = text.strip()
+        if text_stripped.startswith("def ") or text_stripped.startswith("class "):
+            return text_stripped
+
+        # Fallback 2: 查找文本中任何以 def/class 开头的代码
+        lines = text.split('\n')
+        code_started = False
+        code_lines = []
+        for line in lines:
+            if line.strip().startswith('def ') or line.strip().startswith('class '):
+                code_started = True
+            if code_started:
+                code_lines.append(line)
+
+        if code_lines:
+            return '\n'.join(code_lines).strip()
+
+        return ""
+
+    def __call__(self, completions, solution=None, test_list=None, **kwargs) -> List[float]:
+        """
+        计算 MBPP 代码执行的 reward
+
+        Args:
+            completions: 模型生成的代码文本列表（可能包含 Markdown 标记）
+            solution: 测试用例列表（Python 断言语句）- 兼容旧配置
+            test_list: 测试用例列表 - MBPP原始字段名
+
+        Returns:
+            rewards: 1.0 如果所有测试通过，0.0 否则
+
+        Note:
+            优先使用 test_list（MBPP原始字段），兼容 solution 参数
+        """
+        import sys
+
+        # 使用 print 确保调试信息出现在 stdout（会被日志捕获）
+        def debug_print(msg):
+            print(f"[MBPPCodeExecution] {msg}", file=sys.stderr, flush=True)
+
+        # 调试: 记录传入的参数
+        debug_print(f"Called with {len(completions)} completions")
+        debug_print(f"test_list is {'not None' if test_list is not None else 'None'} "
+                   f"(type: {type(test_list).__name__ if test_list is not None else 'N/A'}, "
+                   f"len={len(test_list) if test_list is not None else 0})")
+        debug_print(f"solution is {'not None' if solution is not None else 'None'} "
+                   f"(type: {type(solution).__name__ if solution is not None else 'N/A'})")
+        debug_print(f"Other kwargs keys: {list(kwargs.keys())}")
+
+        # 优先使用 test_list（避免与MBPP的solution字段冲突）
+        tests = test_list if test_list is not None else solution
+        if tests is None:
+            debug_print("ERROR: Neither test_list nor solution provided!")
+            raise ValueError("MBPPCodeExecution requires either 'test_list' or 'solution' parameter")
+
+        rewards = []
+        num_extracted = 0
+        num_passed = 0
+
+        # tests应该是所有completion共享的测试用例列表，不是每个completion一个
+        # 如果tests是嵌套列表（每个样本有不同的测试），保持原逻辑
+        # 如果tests是简单列表（所有样本共享测试），broadcast到所有completions
+        if tests and isinstance(tests[0], list):
+            # tests是嵌套列表：[[test1, test2], [test3, test4], ...]
+            # 这是batch处理模式，每个completion有不同的测试
+            test_cases_list = tests
+        else:
+            # tests是简单列表：[test1, test2, ...]
+            # 这是单样本模式，所有completions共享相同的测试
+            test_cases_list = [tests] * len(completions)
+
+        for idx, (completion, test_cases) in enumerate(zip(completions, test_cases_list)):
+            # 1. 提取代码块
+            code = self.extract_code_blocks(completion)
+
+            # 如果没有提取到代码，返回 0
+            if not code or code.strip() == "":
+                if idx == 0:  # 只记录第一个样本的详情
+                    debug_print(f"Sample 0: No code extracted from completion: {completion[:300]}...")
+                rewards.append(0.0)
+                continue
+
+            num_extracted += 1
+
+            try:
+                # 2. 组合测试用例为一个测试字符串
+                # code_eval 期望 references 是字符串列表，每个字符串包含所有要执行的测试代码
+                # 格式: ["assert1\nassert2\nassert3"] 而不是 [["assert1", "assert2", "assert3"]]
+                if isinstance(test_cases, list):
+                    combined_tests = "\n".join(test_cases)
+                else:
+                    combined_tests = test_cases
+
+                if idx == 0:  # 记录第一个样本的详情
+                    debug_print(f"Sample 0 code (first 200 chars): {code[:200]}...")
+                    debug_print(f"Sample 0 tests: {combined_tests[:200]}...")
+
+                # 3. 使用 code_eval 执行代码并验证测试用例
+                # references: 合并后的测试字符串列表
+                # predictions: 代码候选列表（嵌套列表格式）
+                results, logs = self.code_eval.compute(
+                    references=[combined_tests],  # 合并后的测试字符串
+                    predictions=[[code]],  # 生成的代码
+                    k=[1]  # Pass@1
+                )
+
+                # 4. 返回 Pass@1 结果（0.0 或 1.0）
+                reward = float(results["pass@1"])
+                rewards.append(reward)
+                if reward > 0:
+                    num_passed += 1
+
+                if idx == 0:
+                    debug_print(f"Sample 0 result: pass@1={reward}")
+
+            except Exception as e:
+                # 代码执行失败（语法错误、运行时错误等）
+                if idx == 0:
+                    debug_print(f"Sample 0 error: {e}")
+                    debug_print(f"Sample 0 code was: {code[:300]}...")
+                rewards.append(0.0)
+
+        debug_print(f"Summary: {num_extracted}/{len(completions)} code extracted, "
+                   f"{num_passed}/{len(completions)} passed")
+
+        return rewards
+
+
 class Format(ORM):
 
     def __call__(self, completions, **kwargs) -> List[float]:
@@ -366,8 +545,14 @@ class CosineReward(ORM):
         import math
         return max_value - (max_value - min_value) * (1 - math.cos(t * math.pi / T)) / 2
 
-    def __call__(self, completions, solution, **kwargs) -> List[float]:
-        acc_rewards = self.accuracy_orm(completions, solution, **kwargs)
+    def __call__(self, completions, **kwargs) -> List[float]:
+        # Extract solution from kwargs (will be passed to accuracy_orm)
+        solution = kwargs.get('solution')
+        if solution is None:
+            raise ValueError("CosineReward requires 'solution' field in the dataset.")
+
+        # Pass solution through kwargs to the accuracy ORM
+        acc_rewards = self.accuracy_orm(completions, **kwargs)
         response_token_ids = kwargs.get('response_token_ids')
         rewards = []
         for ids, acc_reward in zip(response_token_ids, acc_rewards):
@@ -446,6 +631,7 @@ orms = {
     'toolbench': ReactORM,
     'math': MathORM,
     'accuracy': MathAccuracy,
+    'mbpp': MBPPCodeExecution,  # MBPP 代码执行验证 (与 lm-eval 一致)
     'format': Format,
     'react_format': ReActFormat,
     'cosine': CosineReward,

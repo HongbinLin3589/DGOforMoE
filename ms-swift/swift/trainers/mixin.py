@@ -137,6 +137,30 @@ class SwiftMixin:
             # so reading train_state is skipped here.
             self.args.resume_from_checkpoint = None
 
+    def _add_moe_monitor_callback(self):
+        """Add MoE monitoring callback if enabled."""
+        if not getattr(self.args, 'moe_monitor_enabled', False):
+            return
+
+        try:
+            from swift.trainers.moe_callback import MoEMonitorCallback
+
+            moe_callback = MoEMonitorCallback(
+                ref_model=None,  # SFT doesn't have ref_model
+                log_every=getattr(self.args, 'moe_log_every', 100),
+                save_dir=getattr(self.args, 'moe_save_dir', None),
+                enabled=True
+            )
+            # 保存 trainer 引用，用于在 on_step_end 中调用 trainer.log()
+            moe_callback._trainer = self
+            # ✅ FIX: 插入到callback列表开头，确保on_log在TensorBoard之前执行
+            # 这样MoE指标会被添加到logs dict中，然后TensorBoard才能记录它们
+            self.callback_handler.callbacks.insert(0, moe_callback)
+            logger.info("✅ MoE monitoring callback added to trainer (inserted at position 0)")
+        except ImportError as e:
+            logger.warning(f"⚠️  Failed to import MoEMonitorCallback: {e}")
+            logger.warning("   MoE monitoring will be disabled.")
+
     @contextmanager
     def _patch_timeout(self):
         from modelscope.hub.api import HubApi

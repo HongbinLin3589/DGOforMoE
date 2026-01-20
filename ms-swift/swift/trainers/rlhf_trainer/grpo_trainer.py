@@ -53,6 +53,10 @@ from .utils import (_ForwardRedirection, compute_chord_loss, get_even_process_da
                     load_pil_img, make_chord_sft_dataset, pad_logps_back_to_batch, patch_profiling_context,
                     patch_profiling_decorator, patch_save_last_checkpoint, replace_assistant_response_with_ids)
 
+# Import trainers to apply OLMoE load_balancing_loss_func patch for DeepSpeed ZeRO compatibility
+# This patch is defined in trainers.py and applied on module load
+from swift.trainers import trainers as _  # noqa: F401  # Trigger module-level patch execution
+
 try:
     from trl.trainer.utils import entropy_from_logits
 except ImportError:
@@ -137,6 +141,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         if args.sync_ref_model:
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
 
+        # Add MoE monitoring callback if enabled
+        if getattr(args, 'moe_monitor_enabled', False):
+            self._add_moe_monitor_callback(ref_model)
+
         if self.args.dynamic_sample or self.template.truncation_strategy == 'raise':
             self._prepare_resample_data_iterator()
         # flag indicating whether the evaluation has started
@@ -157,6 +165,30 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # `_get_train_sampler` and `_prepare_inputs`.
         self._buffered_inputs = None
         self._current_train_step_time = 0.0
+
+    def _add_moe_monitor_callback(self, ref_model):
+        """
+        Add MoE monitoring callback if enabled.
+        """
+        # Check if MoE monitoring is enabled
+        if not getattr(self.args, 'moe_monitor_enabled', False):
+            return
+
+        try:
+            from swift.trainers.moe_callback import MoEMonitorCallback
+
+            moe_callback = MoEMonitorCallback(
+                ref_model=ref_model,  # GRPO has ref_model
+                log_every=getattr(self.args, 'moe_log_every', 100),
+                save_dir=getattr(self.args, 'moe_save_dir', None),
+                enabled=True
+            )
+            # ✅ FIX: 插入到callback列表开头，确保on_log在TensorBoard之前执行
+            self.callback_handler.callbacks.insert(0, moe_callback)
+            logger.info("✅ MoE monitoring callback added to GRPO trainer (inserted at position 0)")
+        except ImportError as e:
+            logger.warning(f"⚠️  Failed to import MoEMonitorCallback: {e}")
+            logger.warning("   MoE monitoring will be disabled. Make sure moe_monitor.py is in the project root.")
 
     def _get_train_sampler(self, train_dataset=None):
         if self.template.sequence_parallel_size > 1:
