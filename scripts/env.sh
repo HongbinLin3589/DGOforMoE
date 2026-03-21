@@ -30,7 +30,7 @@ export HF_HOME="/usr/storage/fwan/huggingface_cache"
 export HF_HUB_CACHE="${HF_HOME}/hub"
 export HF_ENDPOINT="https://hf-mirror.com"
 export USE_HF=1
-export HF_TOKEN="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"
+export HF_TOKEN="your HF_TOKEN"
 
 # =============================================================================
 # 模型路径（本地缓存）
