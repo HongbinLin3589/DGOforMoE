@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 from datasets import load_dataset, Dataset
 from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
 from transformers import AutoTokenizer
 
 # =================================================================================
@@ -34,23 +35,36 @@ from datasets_config import DatasetLoader, SYSTEM_PROMPTS, EXTRACT_ANSWER_FUNCS,
 # 数据集特定的 prompt 格式
 # =================================================================================
 
+_MATH_SYSTEM = (
+    "You are an expert mathematical problem solver. Think step by step, showing all your "
+    "reasoning inside <thinking> tags. Then give your final answer as \\boxed{ANSWER} inside "
+    "<answer> tags.\n\n"
+    "Format your response exactly like this:\n"
+    "<thinking>\n[your step-by-step reasoning]\n</thinking>\n"
+    "<answer>\\boxed{ANSWER}</answer>"
+)
+
 SYSTEM_PROMPTS_CUSTOM = {
-    "gsm8k": "You are an expert in math reasoning. Your goal is to help the user solve math problems. You should think step by step and give the final answer in the format <answer>ANSWER</answer>.",
-    "math": "You are an expert in mathematical problem solving. Solve the given problem step by step and provide the final answer in a box using \\boxed{answer} format.",
+    "gsm8k":   _MATH_SYSTEM,
+    "bigmath": _MATH_SYSTEM,
+    "math":    _MATH_SYSTEM,
     "mbpp": "You are an expert Python programmer. Write clean, efficient, and correct Python code to solve the given problem."
 }
 
 XML_COT_FORMAT = "<thinking>\n{reasoning}\n</thinking>\n<answer>\n{answer}\n</answer>"
 
 # Few-shot examples for each dataset
+_MATH_FEW_SHOT = {
+    'question': 'What is the largest single-digit prime number?',
+    'assistant': XML_COT_FORMAT.format(
+        reasoning="9 is divisible by 3 and 8 is divisible by 2, but 7 is prime.",
+        answer="\\boxed{7}"
+    )
+}
+
 FEW_SHOT_EXAMPLES = {
-    "gsm8k": {
-        'question': 'What is the largest single-digit prime number?',
-        'assistant': XML_COT_FORMAT.format(
-            reasoning="9 is divisible by 3 and 8 is divisible by 2, but 7 is prime.",
-            answer="7"
-        )
-    },
+    "gsm8k":   _MATH_FEW_SHOT,
+    "bigmath": _MATH_FEW_SHOT,
     "math": {
         'question': 'What is the value of 2 + 2?',
         # 使用<answer>标签格式，与GSM8K保持一致
@@ -63,11 +77,26 @@ FEW_SHOT_EXAMPLES = {
 }
 
 def extract_hash_answer(text: str) -> str | None:
-    """从文本中提取 #### XXXX 格式的答案。"""
+    """从文本中提取 #### XXXX 格式的答案（仅数字，用于GSM8K）。"""
     match = re.search(r"####\s*([\d,]+)", text)
     if match:
         return match.group(1).replace(',', '')
     return None
+
+def extract_bigmath_answer(text: str) -> str | None:
+    """从BigMath答案字段提取，返回完整 \\boxed{value} 供 math_verify.parse() 使用。
+    兼容旧 #### 格式。
+    """
+    text = text.strip()
+    # 新格式：\boxed{value} — 直接返回，parse() 能正确处理所有符号表达式
+    match = re.search(r'(\\boxed\{.+\})', text, re.DOTALL)
+    if match:
+        return match.group(1)
+    # 兼容旧 #### 格式
+    match = re.search(r"####\s*(.+)", text)
+    if match:
+        return match.group(1).strip()
+    return text if text else None
 
 def extract_math_answer(text: str) -> str | None:
     """从 MATH 格式提取答案 (\\boxed{...})"""
@@ -109,11 +138,12 @@ def preprocess_dataset(dataset_name: str, data: Dataset, system_prompt: str = No
 
     print(f">>> 预处理数据集（Base Model模式：直接文本拼接）...")
 
-    if dataset_name_lower == "gsm8k":
-        # GSM8K 格式处理 - 直接拼接few-shot文本
+    if dataset_name_lower in ("gsm8k", "bigmath"):
+        # GSM8K / BigMath 格式处理 - 两者字段格式完全相同
+        # bigmath 用宽松提取（支持LaTeX/区间/复数等）
+        _ans_extractor = extract_bigmath_answer if dataset_name_lower == "bigmath" else extract_hash_answer
         def preprocess_gsm8k(x):
-            example = FEW_SHOT_EXAMPLES["gsm8k"]
-            # 直接拼接文本，不使用chat template
+            example = FEW_SHOT_EXAMPLES[dataset_name_lower]
             prompt_text = f"""{system_prompt}
 
 Example:
@@ -123,8 +153,8 @@ A: {example['assistant']}
 Q: {x['question']}
 A:"""
             return {
-                'prompt': prompt_text,  # 直接返回字符串，不是chat格式
-                'answer': extract_hash_answer(x['answer'])
+                'prompt': prompt_text,
+                'answer': _ans_extractor(x['answer'])
             }
         data = data.map(preprocess_gsm8k)
 
@@ -183,6 +213,13 @@ def main(args):
     print(f"    max_num_seqs: {args.max_num_seqs}")
     print(f"    max_num_batched_tokens: {args.max_num_batched_tokens}")
 
+    # 检查是否使用 LoRA
+    use_lora = args.lora_path is not None
+    if use_lora:
+        print(f">>> LoRA配置:")
+        print(f"    lora_path: {args.lora_path}")
+        print(f"    max_lora_rank: {args.max_lora_rank}")
+
     llm = LLM(
         model=args.model_name,
         trust_remote_code=True,
@@ -193,7 +230,20 @@ def main(args):
         max_num_batched_tokens=args.max_num_batched_tokens,  # 每批最大token数
         swap_space=args.swap_space,  # CPU swap空间(GB)，用于更大batch
         dtype="bfloat16",  # 使用bf16节省显存
+        # LoRA 配置
+        enable_lora=use_lora,
+        max_lora_rank=args.max_lora_rank if use_lora else None,
     )
+
+    # 创建 LoRARequest（如果使用 LoRA）
+    lora_request = None
+    if use_lora:
+        lora_request = LoRARequest(
+            lora_name="sft_adapter",
+            lora_int_id=1,
+            lora_path=args.lora_path,
+        )
+        print(f">>> LoRA adapter 已加载: {args.lora_path}")
 
     # 加载并预处理数据集
     print(f"正在加载数据集: {args.dataset}, split={args.dataset_split}")
@@ -228,7 +278,10 @@ def main(args):
 
     # 运行推理
     print("开始推理...")
-    outputs = llm.generate(prompts, sampling_params)
+    if lora_request:
+        outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
+    else:
+        outputs = llm.generate(prompts, sampling_params)
     print("推理完成。")
 
     # 处理并保存结果
@@ -273,7 +326,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="使用 vLLM 对多个数据集进行快速推理（支持 GSM8K, MATH, MBPP）")
     parser.add_argument("--model_name", type=str, default="mistralai/Mixtral-8x7B-Instruct", help="用于推理的模型名称或路径。")
-    parser.add_argument("--dataset", type=str, default="gsm8k", choices=["gsm8k", "math", "mbpp"], help="要推理的数据集 (gsm8k, math, mbpp)。")
+    parser.add_argument("--dataset", type=str, default="gsm8k", choices=["gsm8k", "math", "mbpp", "bigmath"], help="要推理的数据集 (gsm8k, math, mbpp, bigmath)。")
     parser.add_argument("--dataset_split", type=str, default="train", help="要使用的数据集 split ('train' 或 'test')。")
     parser.add_argument("--output_file", type=str, default=None, help="保存推理结果的文件。如不指定，自动生成为 inference_results_{dataset}.json。")
     parser.add_argument("--tensor_parallel_size", type=int, default=8, help="使用的 GPU 数量。")
@@ -292,6 +345,12 @@ if __name__ == "__main__":
                         help="每批最大token数。None=自动。可设为8192/16384/32768等。")
     parser.add_argument("--swap_space", type=float, default=4,
                         help="CPU swap空间(GB)，用于支持更大batch。默认4GB。")
+
+    # LoRA 参数
+    parser.add_argument("--lora_path", type=str, default=None,
+                        help="LoRA adapter路径（SFT checkpoint）。如不指定则使用基础模型。")
+    parser.add_argument("--max_lora_rank", type=int, default=64,
+                        help="LoRA最大rank。默认64。")
 
     args = parser.parse_args()
 

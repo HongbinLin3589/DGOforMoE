@@ -76,3 +76,32 @@ proxy.sh
 
 # lm-evaluation-harness
 lm-evaluation-harness/
+dgo_cache/
+gcloud.sh
+.claude/
+OLMoE/
+
+# ms-swift runtime generated files
+# ms-swift/swift/llm/dataset/data/
+# ms-swift/swift/llm/ds_config/
+# ms-swift/swift/llm/fsdp_config/
+# ms-swift/scripts/benchmark/config/
+# ms-swift/tests/llm/config/
+# ms-swift/tests/llm/data/
+
+# ms-swift examples (too large for git)
+# ms-swift/examples/train/rft/*.json
+# ms-swift/examples/train/multi-gpu/*/fsdp*.json
+# ms-swift/examples/ascend/train/*/fsdp*.json
+
+# Backup files
+*.backup
+*.bak
+*.old
+*_backup.py
+*_old.py
+
+# Dataset files (preprocessed data should not be in git)
+datasets/
+
+ms-swift/swift/plugin/loss_scale/config/

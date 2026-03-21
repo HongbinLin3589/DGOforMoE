@@ -3,16 +3,18 @@
 # MS-Swift GRPO Training Script for 4 MoE Models × 3 Datasets
 # =============================================================================
 # 使用方法:
-#   ./run_grpo_swift.sh MODEL_NAME DATASET_NAME
+#   ./run_grpo_swift.sh MODEL_NAME DATASET_NAME [SFT_CHECKPOINT]
 #
 # 示例:
-#   ./run_grpo_swift.sh olmoe gsm8k
+#   ./run_grpo_swift.sh olmoe gsm8k                           # 从基础模型开始
+#   ./run_grpo_swift.sh olmoe gsm8k /path/to/sft/checkpoint   # 从SFT checkpoint继续
 #   ./run_grpo_swift.sh qwen math
 #   ./run_grpo_swift.sh deepseek mbpp
 #   ./run_grpo_swift.sh mixtral gsm8k
 #
 # 模型选项: olmoe, qwen, deepseek, mixtral
 # 数据集选项: gsm8k, math, mbpp
+# SFT_CHECKPOINT: 可选，SFT训练后的LoRA checkpoint路径
 # =============================================================================
 
 set -e
@@ -40,6 +42,7 @@ declare -A MAX_LENGTH
 MAX_LENGTH["gsm8k"]=1024
 MAX_LENGTH["math"]=1024
 MAX_LENGTH["mbpp"]=1024
+MAX_LENGTH["bigmath"]=1024
 
 # vLLM 配置映射 - 根据模型大小调整
 declare -A VLLM_TP_SIZE
@@ -49,7 +52,7 @@ VLLM_TP_SIZE["deepseek"]=2
 VLLM_TP_SIZE["mixtral"]=2
 
 declare -A VLLM_MEM_UTIL
-VLLM_MEM_UTIL["olmoe"]=0.3
+VLLM_MEM_UTIL["olmoe"]=0.2
 VLLM_MEM_UTIL["qwen"]=0.3
 VLLM_MEM_UTIL["deepseek"]=0.3
 VLLM_MEM_UTIL["mixtral"]=0.3
@@ -63,7 +66,7 @@ MODEL_TEMPLATE["mixtral"]="default"
 
 # 按模型大小调整 batch size
 declare -A MODEL_BATCH_SIZE
-MODEL_BATCH_SIZE["olmoe"]=8
+MODEL_BATCH_SIZE["olmoe"]=1
 MODEL_BATCH_SIZE["qwen"]=8
 MODEL_BATCH_SIZE["deepseek"]=8
 MODEL_BATCH_SIZE["mixtral"]=2
@@ -83,10 +86,18 @@ MODEL_DEEPSPEED["mixtral"]="zero2"
 
 # GRPO 特定参数
 declare -A MODEL_NUM_GENERATIONS
-MODEL_NUM_GENERATIONS["olmoe"]=4
+MODEL_NUM_GENERATIONS["olmoe"]=2
 MODEL_NUM_GENERATIONS["qwen"]=8
 MODEL_NUM_GENERATIONS["deepseek"]=8
 MODEL_NUM_GENERATIONS["mixtral"]=8
+
+# LoRA target_modules 配置 - 排除 router gate 以保持路由稳定性
+# 注意：不使用 all-linear 是为了避免训练 mlp.gate (router)
+declare -A MODEL_TARGET_MODULES
+MODEL_TARGET_MODULES["olmoe"]="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["qwen"]="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["deepseek"]="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["mixtral"]="q_proj k_proj v_proj o_proj w1 w2 w3"
 
 BETA=0.01
 NUM_EPOCHS=5
@@ -96,6 +107,7 @@ NUM_EPOCHS=5
 # =============================================================================
 MODEL_KEY="${1:-olmoe}"
 DATASET_KEY="${2:-gsm8k}"
+SFT_CHECKPOINT="${3:-}"  # 可选：SFT checkpoint路径
 
 # 验证模型
 MODEL_PATH=$(get_model_path "$MODEL_KEY")
@@ -111,6 +123,9 @@ if [[ ! -d "$MODEL_PATH" ]]; then
 fi
 
 MAX_LEN="${MAX_LENGTH[$DATASET_KEY]}"
+
+# 获取系统提示
+SYSTEM_PROMPT=$(get_system_prompt "$DATASET_KEY")
 
 # 数据集配置
 case "$DATASET_KEY" in
@@ -129,9 +144,14 @@ case "$DATASET_KEY" in
         REWARD_FUNC="mbpp"
         COLUMNS='{"problem": "query"}'
         ;;
+    bigmath)
+        DATASET_PATH=$(get_dataset_path bigmath)
+        REWARD_FUNC="accuracy"
+        COLUMNS='{"question": "query", "answer": "solution"}'
+        ;;
     *)
         echo "❌ 未知数据集: $DATASET_KEY"
-        echo "可用数据集: gsm8k, math, mbpp"
+        echo "可用数据集: gsm8k, math, mbpp, bigmath"
         exit 1
         ;;
 esac
@@ -154,6 +174,7 @@ BATCH_SIZE="${MODEL_BATCH_SIZE[$MODEL_KEY]:-8}"
 GRADIENT_ACCUMULATION="${MODEL_GRAD_ACCUM[$MODEL_KEY]:-4}"
 DEEPSPEED="${MODEL_DEEPSPEED[$MODEL_KEY]:-zero2}"
 NUM_GENERATIONS="${MODEL_NUM_GENERATIONS[$MODEL_KEY]:-8}"
+TARGET_MODULES="${MODEL_TARGET_MODULES[$MODEL_KEY]:-all-linear}"
 
 # =============================================================================
 # 打印配置
@@ -167,6 +188,7 @@ echo "数据集: $DATASET_PATH"
 echo "输出目录: $OUTPUT_DIR"
 echo "template: $TEMPLATE"
 echo "columns: $COLUMNS"
+echo "system_prompt: $(echo "$SYSTEM_PROMPT" | head -1)..."
 echo "batch_size: $BATCH_SIZE"
 echo "gradient_accumulation: $GRADIENT_ACCUMULATION"
 echo "global_batch: $((BATCH_SIZE * GRADIENT_ACCUMULATION * NPROC_PER_NODE))"
@@ -178,10 +200,21 @@ echo "reward_func: $REWARD_FUNC"
 echo "vllm_tensor_parallel_size: $VLLM_TP"
 echo "vllm_gpu_memory_utilization: $VLLM_MEM"
 echo ""
+echo "LoRA 配置:"
+echo "  target_modules: $TARGET_MODULES"
+echo "  (注: 排除 router gate 以保持路由稳定性)"
+echo ""
 echo "MoE 配置:"
 echo "  router_aux_loss_coef: ${ROUTER_AUX_LOSS_COEF:-$DEFAULT_ROUTER_AUX_LOSS_COEF}"
 echo "  moe_monitor_enabled: ${MOE_MONITOR_ENABLED:-$DEFAULT_MOE_MONITOR_ENABLED}"
 echo "  moe_log_every: ${MOE_LOG_EVERY:-$DEFAULT_MOE_LOG_EVERY}"
+echo ""
+echo "SFT Checkpoint:"
+if [[ -n "$SFT_CHECKPOINT" ]]; then
+    echo "  adapters: $SFT_CHECKPOINT"
+else
+    echo "  adapters: (从基础模型开始)"
+fi
 echo "============================================================"
 
 # =============================================================================
@@ -189,11 +222,30 @@ echo "============================================================"
 # =============================================================================
 echo "🚀 开始 GRPO 训练..."
 
+# 构建 adapters 参数
+ADAPTERS_ARG=""
+if [[ -n "$SFT_CHECKPOINT" ]]; then
+    if [[ -d "$SFT_CHECKPOINT" ]]; then
+        # GRPO需要同时设置adapters和ref_adapters
+        # - adapters: 用于训练模型的LoRA adapter
+        # - ref_adapters: 用于参考模型的LoRA adapter（计算KL散度）
+        ADAPTERS_ARG="--adapters $SFT_CHECKPOINT --ref_adapters $SFT_CHECKPOINT"
+        echo "📦 加载 SFT checkpoint: $SFT_CHECKPOINT"
+        echo "   - adapters: $SFT_CHECKPOINT (训练模型)"
+        echo "   - ref_adapters: $SFT_CHECKPOINT (参考模型)"
+    else
+        echo "❌ SFT checkpoint 路径不存在: $SFT_CHECKPOINT"
+        exit 1
+    fi
+fi
+
 swift rlhf \
     --rlhf_type grpo \
     --model "$MODEL_PATH" \
+    $ADAPTERS_ARG \
     --template "$TEMPLATE" \
     --template_backend swift \
+    --system "$SYSTEM_PROMPT" \
     --dataset "$DATASET_PATH" \
     --columns "$COLUMNS" \
     --output_dir "$OUTPUT_DIR" \
@@ -209,7 +261,7 @@ swift rlhf \
     --lora_rank $DEFAULT_LORA_RANK \
     --lora_alpha $DEFAULT_LORA_ALPHA \
     --lora_dropout $DEFAULT_LORA_DROPOUT \
-    --target_modules all-linear \
+    --target_modules $TARGET_MODULES \
     \
     --torch_dtype bfloat16 \
     --attn_impl sdpa \
@@ -233,7 +285,7 @@ swift rlhf \
     --save_total_limit 10 \
     --logging_steps 10 \
     --warmup_ratio $DEFAULT_WARMUP_RATIO \
-    --dataloader_num_workers 4 \
+    --dataloader_num_workers 0 \
     \
     --num_generations $NUM_GENERATIONS \
     --temperature 1.0 \

@@ -168,6 +168,9 @@ class MoEMonitorCallback(TrainerCallback):
         self._last_logged_step = -1
         self._latest_metrics = {}  # 存储最新的MoE指标供on_log使用
 
+        # 全局累积计数 (用于 MaxVio_global)
+        self._global_expert_counts: Optional[torch.Tensor] = None
+
     def on_train_begin(
         self,
         args: TrainingArguments,
@@ -418,6 +421,15 @@ class MoEMonitorCallback(TrainerCallback):
                         logger.info(f"   ⚠️  高崩溃率: {metrics['collapse_rate']:.1%}")
                     if metrics.get('load_cv', 0) > 1.0:
                         logger.info(f"   ⚠️  高负载不均衡: CV={metrics['load_cv']:.2f}")
+                    # MaxVio 警告: 理想值为 1.0
+                    if metrics.get('maxvio_min_batch', 1.0) < 0.3:
+                        logger.info(f"   ⚠️  有专家严重冷落: min_vio={metrics['maxvio_min_batch']:.2f}")
+                    if metrics.get('maxvio_max_batch', 1.0) > 2.0:
+                        logger.info(f"   ⚠️  有专家严重过载: max_vio={metrics['maxvio_max_batch']:.2f}")
+                    # Aux Loss 警告: 理想值为 1/N
+                    ideal_aux = 1.0 / self.moe_config.num_experts
+                    if metrics.get('aux_loss', ideal_aux) > ideal_aux * 2:
+                        logger.info(f"   ⚠️  Aux Loss 偏高: {metrics['aux_loss']:.4f} (理想≈{ideal_aux:.4f})")
 
         except Exception as e:
             logger.warning(f"⚠️  计算 MoE 指标时出错 (step {state.global_step}): {e}")
@@ -430,7 +442,17 @@ class MoEMonitorCallback(TrainerCallback):
             self.layer_indices_cache = []
 
     def _compute_metrics(self) -> Dict[str, float]:
-        """计算所有 4 个指标（使用 bincount 优化）"""
+        """计算所有 MoE 指标（使用 bincount 优化）
+
+        指标列表:
+        1. load_cv: 负载变异系数 (越小越均衡)
+        2. collapse_rate: 崩溃率 (有多少专家被废弃)
+        3. routing_entropy: 路由熵 (越高越多样)
+        4. max_load: 最大负载 (最繁忙专家的负载)
+        5. maxvio_min_batch/global: 最少使用专家的相对负载 (理想=1.0)
+        6. maxvio_max_batch/global: 最多使用专家的相对负载 (理想=1.0)
+        7. aux_loss: 辅助损失 (理想=1/N)
+        """
         if not self.router_logits_cache:
             return {}
 
@@ -453,6 +475,13 @@ class MoEMonitorCallback(TrainerCallback):
 
             # 计算最大负载 (Max Load)
             metrics['max_load'] = self._compute_max_load()
+
+            # 计算 MaxVio (Loss-Free Balancing 论文)
+            maxvio_metrics = self._compute_maxvio()
+            metrics.update(maxvio_metrics)
+
+            # 计算 Aux Loss (Switch Transformer 标准方法)
+            metrics['aux_loss'] = self._compute_aux_loss()
 
             return metrics
 
@@ -505,17 +534,22 @@ class MoEMonitorCallback(TrainerCallback):
 
         return avg_cv, layer_cvs
 
-    def _compute_collapse_rate(self, threshold: float = 0.01) -> float:
+    def _compute_collapse_rate(self, relative_threshold: float = 0.5) -> float:
         """计算路由崩溃率
 
         Args:
-            threshold: 绝对阈值，负载 < threshold 的专家被认为"崩溃"
-                      默认 0.01 (1%)，即负载低于 1% 的专家算崩溃
+            relative_threshold: 相对阈值，负载 < (1/num_experts) * relative_threshold 的专家被认为"崩溃"
+                               默认 0.5，即负载低于理想值的 50% 算崩溃
+                               例如：64专家时，理想负载=1.56%，阈值=0.78%
 
         修复：按层累积后计算每层的崩溃率，返回最大值（最差情况）
         之前的 bug：混合所有层，某层崩溃会被其他层掩盖
         """
         from collections import defaultdict
+
+        # 计算绝对阈值 = 理想负载 * 相对阈值
+        ideal_load = 1.0 / self.moe_config.num_experts
+        threshold = ideal_load * relative_threshold
 
         # Step 1: 按层累积 counts
         layer_counts = defaultdict(lambda: torch.zeros(self.moe_config.num_experts))
@@ -631,6 +665,151 @@ class MoEMonitorCallback(TrainerCallback):
         # Step 3: 返回所有层中的最大值（反映最不均衡的层）
         return max(layer_max_loads) if layer_max_loads else 0.0
 
+    def _compute_maxvio(self) -> Dict[str, float]:
+        """
+        计算负载违规指标 (MaxVio) - 来自 Loss-Free Balancing 论文
+
+        返回 Dict 包含:
+            maxvio_min_batch: 当前batch的最小负载比 (min/avg)
+            maxvio_max_batch: 当前batch的最大负载比 (max/avg)
+            maxvio_min_global: 全局累积的最小负载比
+            maxvio_max_global: 全局累积的最大负载比
+
+        理想值: 1.0 (完美平衡)
+        - min < 1.0 表示有expert被冷落
+        - max > 1.0 表示有expert过载
+
+        公式:
+            min_violation = min(counts) / mean(counts)
+            max_violation = max(counts) / mean(counts)
+
+        与其他指标的关系:
+            - min_violation ≈ 0 时，collapse_rate 升高
+            - max_violation 高时，max_load 也高
+            - 比 load_cv 更直观（直接显示最差/最好的比例）
+
+        Batch vs Global:
+            - Batch: 当前step的瞬时值，波动较大
+            - Global: 整个训练过程的累积值，更稳定
+        """
+        from collections import defaultdict
+
+        # Step 1: 按层累积当前 batch 的 counts
+        batch_counts = torch.zeros(self.moe_config.num_experts)
+
+        for logits, layer_idx in zip(self.router_logits_cache, self.layer_indices_cache):
+            topk_indices = torch.topk(logits, self.moe_config.topk, dim=-1).indices
+            flat_indices = topk_indices.flatten()
+
+            expert_counts = torch.bincount(
+                flat_indices,
+                minlength=self.moe_config.num_experts
+            ).float()
+
+            batch_counts += expert_counts
+
+        # Step 2: 更新全局累积
+        if self._global_expert_counts is None:
+            self._global_expert_counts = torch.zeros(self.moe_config.num_experts)
+        self._global_expert_counts += batch_counts
+
+        # Step 3: 计算 Batch MaxVio
+        result = {}
+        if batch_counts.sum() > 0:
+            avg_batch = batch_counts.mean()
+            result['maxvio_min_batch'] = (batch_counts.min() / avg_batch).item()
+            result['maxvio_max_batch'] = (batch_counts.max() / avg_batch).item()
+        else:
+            result['maxvio_min_batch'] = 0.0
+            result['maxvio_max_batch'] = 0.0
+
+        # Step 4: 计算 Global MaxVio
+        if self._global_expert_counts.sum() > 0:
+            avg_global = self._global_expert_counts.mean()
+            result['maxvio_min_global'] = (self._global_expert_counts.min() / avg_global).item()
+            result['maxvio_max_global'] = (self._global_expert_counts.max() / avg_global).item()
+        else:
+            result['maxvio_min_global'] = 0.0
+            result['maxvio_max_global'] = 0.0
+
+        return result
+
+    def _compute_aux_loss(self) -> float:
+        """
+        计算辅助损失 (Auxiliary Loss) - Switch Transformer 标准方法
+
+        公式: aux_loss = α × Σ(f_i × P_i)
+        其中:
+            f_i = 分配给专家i的token比例 (基于top-k选择)
+            P_i = 专家i被选择的平均概率 (基于softmax)
+            α = 系数 (这里返回未缩放的值)
+
+        目的:
+            - 惩罚负载不均衡
+            - f_i × P_i 高表示: 该专家被选中多(f_i高) 且 概率也高(P_i高) → 不好
+            - 理想情况: 所有专家均衡，aux_loss = 1/num_experts
+
+        理想值:
+            - 完美均衡时: aux_loss = 1/N (N为专家数)
+            - OLMoE (64专家): 理想值 ≈ 0.0156
+            - Mixtral (8专家): 理想值 ≈ 0.125
+
+        注意:
+            - 这个值可以作为监控指标
+            - 也可以加入训练loss (乘以系数如0.01)
+            - 返回的是所有层的平均值
+        """
+        from collections import defaultdict
+
+        # Step 1: 按层累积 f_i 和 P_i
+        layer_f = defaultdict(lambda: torch.zeros(self.moe_config.num_experts))
+        layer_P = defaultdict(lambda: torch.zeros(self.moe_config.num_experts))
+        layer_token_counts = defaultdict(int)
+
+        for logits, layer_idx in zip(self.router_logits_cache, self.layer_indices_cache):
+            # logits: [N, num_experts] where N = batch_size * seq_len
+            N = logits.shape[0]
+
+            # 计算 softmax 概率 (用于 P_i)
+            probs = torch.softmax(logits, dim=-1)  # [N, num_experts]
+
+            # 计算 top-k 选择 (用于 f_i)
+            topk_indices = torch.topk(logits, self.moe_config.topk, dim=-1).indices
+            flat_indices = topk_indices.flatten()
+
+            # f_i: 每个专家被选中的token数
+            expert_counts = torch.bincount(
+                flat_indices,
+                minlength=self.moe_config.num_experts
+            ).float()
+
+            # P_i: 每个专家的平均选择概率
+            avg_probs = probs.mean(dim=0)  # [num_experts]
+
+            # 累积
+            layer_f[layer_idx] += expert_counts
+            layer_P[layer_idx] += avg_probs * N  # 加权累积
+            layer_token_counts[layer_idx] += N
+
+        # Step 2: 每层计算 aux_loss
+        layer_aux_losses = []
+
+        for layer_idx in layer_f.keys():
+            total_tokens = layer_token_counts[layer_idx]
+            if total_tokens == 0:
+                continue
+
+            # 归一化
+            f_i = layer_f[layer_idx] / (total_tokens * self.moe_config.topk)  # token分配比例
+            P_i = layer_P[layer_idx] / total_tokens  # 平均概率
+
+            # aux_loss = Σ(f_i × P_i)
+            aux_loss = (f_i * P_i).sum().item()
+            layer_aux_losses.append(aux_loss)
+
+        # Step 3: 返回所有层的平均值
+        return sum(layer_aux_losses) / len(layer_aux_losses) if layer_aux_losses else 0.0
+
     def on_log(
         self,
         args: TrainingArguments,
@@ -674,6 +853,7 @@ class MoEMonitorCallback(TrainerCallback):
         self.hook_handles = []
         self.router_logits_cache = []
         self.layer_indices_cache = []
+        self._global_expert_counts = None  # 清理全局累积
 
         # 只在主进程保存指标和打印日志
         if not state.is_world_process_zero:
@@ -690,7 +870,7 @@ class MoEMonitorCallback(TrainerCallback):
                     logger.info(f"   指标已保存到: {self.save_dir}/moe_metrics.json")
 
                     if self.monitor.history.get('step'):
-                        for metric in ['load_cv', 'collapse_rate']:
+                        for metric in ['load_cv', 'collapse_rate', 'aux_loss', 'maxvio_min_global', 'maxvio_max_global']:
                             if metric in self.monitor.history:
                                 values = self.monitor.history[metric]
                                 if values:
@@ -758,4 +938,25 @@ Config 属性对照:
 - Qwen:     config.num_experts=60, config.num_experts_per_tok=4
 - DeepSeek: config.n_routed_experts=64, config.num_experts_per_tok=6
 - Mixtral:  config.num_local_experts=8, config.num_experts_per_tok=2
+
+指标说明:
+| 指标                | 公式                          | 理想值      | 含义                        |
+|---------------------|-------------------------------|-------------|----------------------------|
+| load_cv             | std(load) / mean(load)        | 0           | 负载变异系数，越小越均衡     |
+| collapse_rate       | count(load < 0.5×avg) / N     | 0           | 被废弃的专家比例            |
+| routing_entropy     | -Σ(p×log(p)) / log(N)         | 1.0         | 路由多样性，越高越均匀       |
+| max_load            | max(load)                     | 1/N         | 最繁忙专家的负载            |
+| maxvio_min_batch    | min(counts) / mean(counts)    | 1.0         | 最冷门专家的相对负载(batch) |
+| maxvio_max_batch    | max(counts) / mean(counts)    | 1.0         | 最热门专家的相对负载(batch) |
+| maxvio_min_global   | 同上，全局累积                 | 1.0         | 最冷门专家的相对负载(全局)  |
+| maxvio_max_global   | 同上，全局累积                 | 1.0         | 最热门专家的相对负载(全局)  |
+| aux_loss            | Σ(f_i × P_i)                  | 1/N         | Switch Transformer辅助损失 |
+
+理想值参考 (以 64 专家为例):
+- load_cv < 0.5 (良好), > 1.0 (警告)
+- collapse_rate = 0 (良好), > 0.3 (严重)
+- routing_entropy > 0.9 (良好), < 0.5 (警告)
+- maxvio_min > 0.5 (良好), < 0.3 (警告)
+- maxvio_max < 2.0 (良好), > 3.0 (警告)
+- aux_loss ≈ 0.0156 (良好，1/64)
 """

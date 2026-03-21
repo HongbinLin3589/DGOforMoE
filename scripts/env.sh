@@ -19,12 +19,18 @@ else
 fi
 
 # =============================================================================
+# Python 路径配置（确保 moe_monitor.py 等模块可被导入）
+# =============================================================================
+export PYTHONPATH="${DGO_ROOT}:${PYTHONPATH}"
+
+# =============================================================================
 # HuggingFace 配置
 # =============================================================================
 export HF_HOME="/usr/storage/fwan/huggingface_cache"
 export HF_HUB_CACHE="${HF_HOME}/hub"
 export HF_ENDPOINT="https://hf-mirror.com"
 export USE_HF=1
+export HF_TOKEN="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"
 
 # =============================================================================
 # 模型路径（本地缓存）
@@ -57,7 +63,9 @@ export DGO_DATASETS="${DGO_ROOT}/datasets"
 
 # 输出路径配置（可修改为其他磁盘以存储大文件）
 # 默认使用 /root/autodl-fs，可通过环境变量覆盖
-export DGO_STORAGE="${DGO_STORAGE:-/root/autodl-fs}"
+# export DGO_STORAGE="${DGO_STORAGE:-/root/autodl-fs}"
+# export DGO_STORAGE="${DGO_STORAGE:-/usr/commondata/public/hf_hub/cc/DGO}"
+export DGO_STORAGE="/usr/commondata/public/hf_hub/cc/DGO"
 export DGO_OUTPUTS="${DGO_STORAGE}/outputs"
 export DGO_LOGS="${DGO_STORAGE}/logs"
 export DGO_CACHE="${DGO_STORAGE}/dgo_cache"
@@ -82,15 +90,17 @@ export MBPP_HF="google-research-datasets/mbpp"
 
 # 本地数据集路径
 export MBPP_LOCAL="${DGO_DATASETS}/mbpp_json/train.json"
+export BIGMATH_LOCAL="${HF_HOME}/datasets/bigmath_bimodal_10k.json"
 
 # 数据集名称到路径的映射函数
 get_dataset_path() {
     local dataset_key="$1"
     case "$dataset_key" in
-        gsm8k) echo "$GSM8K_HF" ;;
-        math)  echo "$MATH_HF" ;;
-        mbpp)  echo "$MBPP_LOCAL" ;;
-        *)     echo "" ;;
+        gsm8k)   echo "$GSM8K_HF" ;;
+        math)    echo "$MATH_HF" ;;
+        mbpp)    echo "$MBPP_LOCAL" ;;
+        bigmath) echo "$BIGMATH_LOCAL" ;;
+        *)       echo "" ;;
     esac
 }
 
@@ -118,6 +128,32 @@ activate_dgo_env() {
 }
 
 # =============================================================================
+# 系统提示（System Prompts）
+# =============================================================================
+# 数学任务：要求模型在 <thinking> 中推理，在 <answer>\boxed{ANSWER}</answer> 中给最终答案
+# 这样 MathAccuracy 可以从 <answer> 标签提取，再用 math_verify.parse("\boxed{...}") 解析
+export MATH_SYSTEM_PROMPT="You are an expert mathematical problem solver. Think step by step, showing all your reasoning inside <thinking> tags. Then give your final answer as \\boxed{ANSWER} inside <answer> tags.
+
+Format your response exactly like this:
+<thinking>
+[your step-by-step reasoning]
+</thinking>
+<answer>\\boxed{ANSWER}</answer>"
+
+# 代码任务：MBPP
+export CODE_SYSTEM_PROMPT="You are an expert Python programmer. Write clean, correct, and efficient Python code to solve the given problem."
+
+# 按数据集获取系统提示的函数
+get_system_prompt() {
+    local dataset_key="$1"
+    case "$dataset_key" in
+        gsm8k|math|bigmath) echo "$MATH_SYSTEM_PROMPT" ;;
+        mbpp)               echo "$CODE_SYSTEM_PROMPT" ;;
+        *)                  echo "$MATH_SYSTEM_PROMPT" ;;
+    esac
+}
+
+# =============================================================================
 # 训练超参数默认值
 # =============================================================================
 export DEFAULT_LORA_RANK=8
@@ -126,7 +162,7 @@ export DEFAULT_LORA_DROPOUT=0.05
 export DEFAULT_LEARNING_RATE="5e-6"
 export DEFAULT_WEIGHT_DECAY=0.1
 export DEFAULT_WARMUP_RATIO=0.1
-export DEFAULT_NUM_EPOCHS=50
+export DEFAULT_NUM_EPOCHS=25
 
 # =============================================================================
 # MoE 监控默认值

@@ -3,10 +3,11 @@
 # DGO Data Generation Script (Inference Only)
 # =============================================================================
 # 使用方法:
-#   bash run_dgo_gen.sh [MODEL_NAME] [DATASET_NAME]
+#   bash run_dgo_gen.sh [MODEL_NAME] [DATASET_NAME] [SFT_CHECKPOINT]
 #
 # 示例:
-#   bash run_dgo_gen.sh olmoe gsm8k          # 默认8卡
+#   bash run_dgo_gen.sh olmoe gsm8k                           # 从基础模型开始
+#   bash run_dgo_gen.sh olmoe gsm8k /path/to/sft/checkpoint   # 从SFT checkpoint继续
 #   bash run_dgo_gen.sh qwen math
 #   bash run_dgo_gen.sh deepseek mbpp
 #   bash run_dgo_gen.sh mixtral gsm8k
@@ -20,6 +21,7 @@
 # 说明:
 #   DGO生成阶段只需要inference，不需要训练
 #   使用vLLM进行快速推理，为每个prompt生成N个response
+#   SFT_CHECKPOINT: 可选，SFT训练后的LoRA checkpoint路径
 # =============================================================================
 
 set -e
@@ -70,6 +72,7 @@ declare -A MAX_LENGTH
 MAX_LENGTH["gsm8k"]=1024
 MAX_LENGTH["math"]=1024
 MAX_LENGTH["mbpp"]=1024
+MAX_LENGTH["bigmath"]=1024
 
 # =============================================================================
 # DGO生成参数
@@ -100,6 +103,7 @@ SWAP_SPACE=8
 # =============================================================================
 MODEL_KEY="${1:-olmoe}"
 DATASET_KEY="${2:-gsm8k}"
+SFT_CHECKPOINT="${3:-}"  # 可选：SFT checkpoint路径
 
 # 验证模型
 MODEL_PATH=$(get_model_path "$MODEL_KEY")
@@ -113,6 +117,16 @@ if [[ ! -d "$MODEL_PATH" ]]; then
     echo "❌ 模型路径不存在: $MODEL_PATH"
     exit 1
 fi
+
+# 验证数据集 key
+case "$DATASET_KEY" in
+    gsm8k|math|mbpp|bigmath) ;;
+    *)
+        echo "❌ 未知数据集: $DATASET_KEY"
+        echo "可用数据集: gsm8k, math, mbpp, bigmath"
+        exit 1
+        ;;
+esac
 
 VLLM_TP="${VLLM_TP_SIZE[$MODEL_KEY]}"
 VLLM_MEM="${VLLM_MEM_UTIL[$MODEL_KEY]}"
@@ -152,6 +166,13 @@ echo "  num_generations: $NUM_GENERATIONS"
 echo "  temperature: $TEMPERATURE"
 echo "  top_p: $TOP_P"
 echo "  并行prompts: $((MAX_SEQS / NUM_GENERATIONS)) (=$MAX_SEQS / $NUM_GENERATIONS)"
+echo ""
+echo "SFT Checkpoint:"
+if [[ -n "$SFT_CHECKPOINT" ]]; then
+    echo "  lora_path: $SFT_CHECKPOINT"
+else
+    echo "  lora_path: (从基础模型开始)"
+fi
 echo "============================================================"
 echo "开始时间: $(date)"
 echo ""
@@ -161,8 +182,21 @@ echo ""
 # =============================================================================
 echo "🚀 开始DGO数据生成 (vLLM inference)..."
 
+# 构建 LoRA 参数
+LORA_ARG=""
+if [[ -n "$SFT_CHECKPOINT" ]]; then
+    if [[ -d "$SFT_CHECKPOINT" ]]; then
+        LORA_ARG="--lora_path $SFT_CHECKPOINT"
+        echo "📦 加载 SFT checkpoint: $SFT_CHECKPOINT"
+    else
+        echo "❌ SFT checkpoint 路径不存在: $SFT_CHECKPOINT"
+        exit 1
+    fi
+fi
+
 python "${DGO_ROOT}/vllm_inference.py" \
     --model_name "$MODEL_PATH" \
+    $LORA_ARG \
     --dataset "$DATASET_KEY" \
     --dataset_split train \
     --n "$NUM_GENERATIONS" \

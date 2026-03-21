@@ -37,6 +37,7 @@ declare -A MAX_LENGTH
 MAX_LENGTH["gsm8k"]=1024
 MAX_LENGTH["math"]=1024
 MAX_LENGTH["mbpp"]=1024
+MAX_LENGTH["bigmath"]=1024
 
 # 按模型大小调整 batch size (保持 global batch = 256)
 declare -A MODEL_BATCH_SIZE
@@ -57,6 +58,14 @@ MODEL_DEEPSPEED["olmoe"]="zero2"      # 小模型用 zero2
 MODEL_DEEPSPEED["qwen"]="zero2"       # 中模型用 zero2
 MODEL_DEEPSPEED["deepseek"]="zero3"   # 较大模型用 zero3
 MODEL_DEEPSPEED["mixtral"]="zero3"    # 大模型用 zero3
+
+# LoRA target_modules 配置 - 排除 router gate 以保持路由稳定性
+# 注意：不使用 all-linear 是为了避免训练 mlp.gate (router)
+declare -A MODEL_TARGET_MODULES
+MODEL_TARGET_MODULES["olmoe"]="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["qwen"]="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["deepseek"]="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["mixtral"]="q_proj k_proj v_proj o_proj w1 w2 w3"
 
 # =============================================================================
 # 参数解析
@@ -79,6 +88,9 @@ fi
 
 MAX_LEN="${MAX_LENGTH[$DATASET_KEY]}"
 
+# 获取系统提示
+SYSTEM_PROMPT=$(get_system_prompt "$DATASET_KEY")
+
 # 数据集列映射配置
 COLUMNS_MAPPING=""
 
@@ -98,9 +110,14 @@ case "$DATASET_KEY" in
         # MBPP 数据集列名: problem -> query, solution -> response
         COLUMNS_MAPPING='{"problem":"query","solution":"response"}'
         ;;
+    bigmath)
+        DATASET_PATH=$(get_dataset_path bigmath)
+        # BigMath 与 GSM8K 相同格式: question -> query, answer -> response
+        COLUMNS_MAPPING='{"question":"query","answer":"response"}'
+        ;;
     *)
         echo "❌ 未知数据集: $DATASET_KEY"
-        echo "可用数据集: gsm8k, math, mbpp"
+        echo "可用数据集: gsm8k, math, mbpp, bigmath"
         exit 1
         ;;
 esac
@@ -120,6 +137,7 @@ BATCH_SIZE="${MODEL_BATCH_SIZE[$MODEL_KEY]:-16}"
 GRADIENT_ACCUMULATION="${MODEL_GRAD_ACCUM[$MODEL_KEY]:-2}"
 EVAL_BATCH_SIZE=$((BATCH_SIZE * 2))
 DEEPSPEED="${MODEL_DEEPSPEED[$MODEL_KEY]:-zero2}"
+TARGET_MODULES="${MODEL_TARGET_MODULES[$MODEL_KEY]:-all-linear}"
 
 # =============================================================================
 # 打印配置
@@ -140,6 +158,8 @@ echo "LoRA 配置:"
 echo "  rank: $DEFAULT_LORA_RANK"
 echo "  alpha: $DEFAULT_LORA_ALPHA"
 echo "  dropout: $DEFAULT_LORA_DROPOUT"
+echo "  target_modules: $TARGET_MODULES"
+echo "  (注: 排除 router gate 以保持路由稳定性)"
 echo ""
 echo "MoE 配置:"
 echo "  router_aux_loss_coef: ${ROUTER_AUX_LOSS_COEF:-$DEFAULT_ROUTER_AUX_LOSS_COEF}"
@@ -159,6 +179,7 @@ fi
 swift sft \
     --model "$MODEL_PATH" \
     --attn_impl sdpa \
+    --system "$SYSTEM_PROMPT" \
     --dataset "$DATASET_PATH" \
     --output_dir "$OUTPUT_DIR" \
     ${COLUMNS_MAPPING:+--columns "$COLUMNS_MAPPING"} \
@@ -167,7 +188,7 @@ swift sft \
     --lora_rank $DEFAULT_LORA_RANK \
     --lora_alpha $DEFAULT_LORA_ALPHA \
     --lora_dropout $DEFAULT_LORA_DROPOUT \
-    --target_modules all-linear \
+    --target_modules $TARGET_MODULES \
     \
     --learning_rate $DEFAULT_LEARNING_RATE \
     --weight_decay $DEFAULT_WEIGHT_DECAY \
@@ -200,7 +221,7 @@ swift sft \
     \
     --report_to tensorboard \
     \
-    --router_aux_loss_coef ${ROUTER_AUX_LOSS_COEF:-$DEFAULT_ROUTER_AUX_LOSS_COEF} \
+    --router_aux_loss_coef 0 \
     --moe_monitor_enabled ${MOE_MONITOR_ENABLED:-$DEFAULT_MOE_MONITOR_ENABLED} \
     --moe_log_every ${MOE_LOG_EVERY:-$DEFAULT_MOE_LOG_EVERY}
 

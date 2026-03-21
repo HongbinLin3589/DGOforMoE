@@ -952,7 +952,11 @@ class SwiftMixin:
             self.control.should_log = False
 
             # all_gather + mean() to get average loss over all processes
-            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+            if hasattr(self, '_nested_gather'):
+                tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+            else:
+                # transformers >= 5.0: _nested_gather removed, DeepSpeed handles reduction
+                tr_loss_scalar = tr_loss.mean().item()
             loss = tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged)
             logs: Dict[str, float] = {'loss': loss}  # loss first
             if version.parse(transformers.__version__) >= version.parse('4.38'):
@@ -1278,7 +1282,7 @@ class DataLoaderMixin:
             }
 
             if hasattr(train_dataset, '__len__'):
-                if args.group_by_length:
+                if getattr(args, 'group_by_length', False):
                     batch_sampler_params['group_by_length'] = args.group_by_length
                     batch_sampler_params['lengths'] = train_dataset['length']
                 batch_sampler = BatchSamplerShard(

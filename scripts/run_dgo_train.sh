@@ -3,11 +3,13 @@
 # DGO Training Script (Offline Weighted SFT)
 # =============================================================================
 # 使用方法:
-#   bash run_dgo_train.sh [MODEL_NAME] [DATASET_NAME] [--freeze_router]
+#   bash run_dgo_train.sh [MODEL_NAME] [DATASET_NAME] [SFT_CHECKPOINT] [--freeze_router]
 #
 # 示例:
-#   bash run_dgo_train.sh olmoe gsm8k              # Group C: 可训练router
-#   bash run_dgo_train.sh olmoe gsm8k --freeze_router  # Group D: 冻结router
+#   bash run_dgo_train.sh olmoe gsm8k                           # Group C: 可训练router
+#   bash run_dgo_train.sh olmoe gsm8k --freeze_router           # Group D: 冻结router
+#   bash run_dgo_train.sh olmoe gsm8k /path/to/sft/checkpoint   # 从SFT checkpoint继续
+#   bash run_dgo_train.sh olmoe gsm8k /path/to/sft/checkpoint --freeze_router
 #   bash run_dgo_train.sh qwen math
 #   bash run_dgo_train.sh deepseek mbpp
 #   bash run_dgo_train.sh mixtral gsm8k
@@ -16,6 +18,7 @@
 #   DGO训练阶段是offline weighted SFT
 #   使用预生成的数据进行训练，每个样本有预计算的权重
 #   参数和GRPO保持一致 (epochs=5, global_batch=256, 等)
+#   SFT_CHECKPOINT: 可选，SFT训练后的LoRA checkpoint路径
 # =============================================================================
 
 set -e
@@ -46,6 +49,7 @@ declare -A MAX_LENGTH
 MAX_LENGTH["gsm8k"]=1024
 MAX_LENGTH["math"]=1024
 MAX_LENGTH["mbpp"]=1024
+MAX_LENGTH["bigmath"]=1024
 
 # 按模型大小调整 batch size
 declare -A MODEL_BATCH_SIZE
@@ -67,6 +71,14 @@ MODEL_DEEPSPEED["qwen"]="zero3"
 MODEL_DEEPSPEED["deepseek"]="zero3"
 MODEL_DEEPSPEED["mixtral"]="zero3"
 
+# LoRA target_modules 配置 - 排除 router gate 以保持路由稳定性
+# 注意：不使用 all-linear 是为了避免训练 mlp.gate (router)
+declare -A MODEL_TARGET_MODULES
+MODEL_TARGET_MODULES["olmoe"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["qwen"]="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["deepseek"]="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["mixtral"]="q_proj k_proj v_proj o_proj w1 w2 w3"
+
 # =============================================================================
 # DGO特定参数
 # =============================================================================
@@ -78,7 +90,13 @@ NUM_EPOCHS=5
 # =============================================================================
 MODEL_KEY="${1:-olmoe}"
 DATASET_KEY="${2:-gsm8k}"
+SFT_CHECKPOINT=""
 FREEZE_ROUTER=""
+
+# 解析第3个参数（可能是SFT_CHECKPOINT或--freeze_router）
+if [[ -n "$3" && "$3" != "--freeze_router" ]]; then
+    SFT_CHECKPOINT="$3"
+fi
 
 # 检查是否有--freeze_router参数
 for arg in "$@"; do
@@ -115,13 +133,26 @@ MAX_LEN="${MAX_LENGTH[$DATASET_KEY]}"
 BATCH_SIZE="${MODEL_BATCH_SIZE[$MODEL_KEY]}"
 GRADIENT_ACCUMULATION="${MODEL_GRAD_ACCUM[$MODEL_KEY]}"
 DEEPSPEED="${MODEL_DEEPSPEED[$MODEL_KEY]}"
+TARGET_MODULES="${MODEL_TARGET_MODULES[$MODEL_KEY]}"
+
+# 获取系统提示（与 generation phase 保持一致）
+SYSTEM_PROMPT=$(get_system_prompt "$DATASET_KEY")
 
 # 根据数据集选择正确的 reward 函数
-if [[ "$DATASET_KEY" == "mbpp" ]]; then
-    REWARD_FUNC="mbpp"
-else
-    REWARD_FUNC="accuracy"
-fi
+case "$DATASET_KEY" in
+    mbpp)    REWARD_FUNC="mbpp" ;;
+    *)       REWARD_FUNC="accuracy" ;;
+esac
+
+# 验证数据集 key
+case "$DATASET_KEY" in
+    gsm8k|math|mbpp|bigmath) ;;
+    *)
+        echo "❌ 未知数据集: $DATASET_KEY"
+        echo "可用数据集: gsm8k, math, mbpp, bigmath"
+        exit 1
+        ;;
+esac
 
 # 输出配置
 if [[ -n "$FREEZE_ROUTER" ]]; then
@@ -166,6 +197,15 @@ echo "LoRA配置:"
 echo "  rank: $DEFAULT_LORA_RANK"
 echo "  alpha: $DEFAULT_LORA_ALPHA"
 echo "  dropout: $DEFAULT_LORA_DROPOUT"
+echo "  target_modules: $TARGET_MODULES"
+echo "  (注: 排除 router gate 以保持路由稳定性)"
+echo ""
+echo "SFT Checkpoint:"
+if [[ -n "$SFT_CHECKPOINT" ]]; then
+    echo "  adapters: $SFT_CHECKPOINT"
+else
+    echo "  adapters: (从基础模型开始)"
+fi
 echo ""
 echo "MoE 配置:"
 echo "  router_aux_loss_coef: ${ROUTER_AUX_LOSS_COEF:-$DEFAULT_ROUTER_AUX_LOSS_COEF}"
@@ -180,11 +220,25 @@ echo ""
 # =============================================================================
 echo "🚀 开始DGO训练..."
 
+# 构建 adapters 参数
+ADAPTERS_ARG=""
+if [[ -n "$SFT_CHECKPOINT" ]]; then
+    if [[ -d "$SFT_CHECKPOINT" ]]; then
+        ADAPTERS_ARG="--adapters $SFT_CHECKPOINT"
+        echo "📦 加载 SFT checkpoint: $SFT_CHECKPOINT"
+    else
+        echo "❌ SFT checkpoint 路径不存在: $SFT_CHECKPOINT"
+        exit 1
+    fi
+fi
+
 swift rlhf \
     --rlhf_type dgo \
     --model "$MODEL_PATH" \
+    $ADAPTERS_ARG \
     --template default \
     --template_backend swift \
+    --system "$SYSTEM_PROMPT" \
     --output_dir "$OUTPUT_DIR" \
     \
     --dgo_data_file "$DGO_DATA_FILE" \
@@ -196,7 +250,7 @@ swift rlhf \
     --lora_rank $DEFAULT_LORA_RANK \
     --lora_alpha $DEFAULT_LORA_ALPHA \
     --lora_dropout $DEFAULT_LORA_DROPOUT \
-    --target_modules all-linear \
+    --target_modules $TARGET_MODULES \
     \
     --torch_dtype bfloat16 \
     --attn_impl sdpa \

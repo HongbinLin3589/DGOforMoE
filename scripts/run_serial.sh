@@ -5,15 +5,16 @@
 cd /usr/commondata/public/hf_hub/cc/DGO/scripts
 
 # olmoe
-# bash ./run_sft_swift.sh olmoe gsm8k
-# bash ./run_grpo_swift.sh olmoe gsm8k
+bash ./run_dgo_gen.sh olmoe math
+bash ./run_dgo_gen.sh olmoe mbpp
+bash ./run_dgo_gen.sh olmoe gsm8k
 
 # qwen
-bash ./run_grpo_swift.sh qwen gsm8k
+# bash ./run_grpo_swift.sh qwen math
 
 # deepseek
-bash ./run_sft_swift.sh deepseek gsm8k
-bash ./run_grpo_swift.sh deepseek gsm8k
+# bash ./run_sft_swift.sh deepseek gsm8k
+# bash ./run_grpo_swift.sh deepseek gsm8k
 
 # mixtral
 # bash ./run_grpo_swift.sh mixtral gsm8k

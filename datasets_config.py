@@ -7,6 +7,7 @@
 
 from typing import Dict, List, Tuple, Optional
 from datasets import load_dataset, Dataset, concatenate_datasets
+import os
 import re
 
 
@@ -46,6 +47,21 @@ DATASET_CONFIGS = {
         "max_length": 2048,
         "supported_splits": ["train", "test"],
     },
+    "bigmath": {
+        "name": "BigMath-Bimodal",
+        "description": "Big-Math-RL-Verified 双峰子集 (60%简单+40%困难，10K条，\\boxed{}格式)",
+        "local_path": os.environ.get(
+            "BIGMATH_LOCAL",
+            "/usr/storage/fwan/huggingface_cache/datasets/bigmath_bimodal_10k.json"
+        ),
+        "hf_name": None,
+        "hf_config": None,
+        "question_field": "question",
+        "answer_field": "answer",          # "\\boxed{value}" 格式，math_verify 可正确解析符号答案
+        "extract_answer_func": "extract_bigmath_answer",
+        "max_length": 1024,
+        "supported_splits": ["train"],
+    },
     "mbpp": {
         "name": "MBPP",
         "description": "MBPP - Mostly Basic Python Problems (full子集: train=374, test=500，与 lm-eval 一致)",
@@ -63,9 +79,19 @@ DATASET_CONFIGS = {
     },
 }
 
+_MATH_SYSTEM_PROMPT = (
+    "You are an expert mathematical problem solver. Think step by step, showing all your "
+    "reasoning inside <thinking> tags. Then give your final answer as \\boxed{ANSWER} inside "
+    "<answer> tags.\n\n"
+    "Format your response exactly like this:\n"
+    "<thinking>\n[your step-by-step reasoning]\n</thinking>\n"
+    "<answer>\\boxed{ANSWER}</answer>"
+)
+
 SYSTEM_PROMPTS = {
-    "gsm8k": "You are an expert in math reasoning. Your goal is to help the user solve math problems. You should think step by step and give the final answer in the format ####ANSWER.",
-    "math": "You are an expert in mathematical problem solving. Solve the given problem step by step and provide the final answer clearly.",
+    "gsm8k":   _MATH_SYSTEM_PROMPT,
+    "math":    _MATH_SYSTEM_PROMPT,
+    "bigmath": _MATH_SYSTEM_PROMPT,
     "mbpp": "You are an expert Python programmer. Write clean, efficient, and correct Python code to solve the given problem.",
 }
 
@@ -75,11 +101,30 @@ SYSTEM_PROMPTS = {
 # ============================================================================
 
 def extract_gsm8k_answer(text: str) -> Optional[str]:
-    """从GSM8K格式提取答案: #### ANSWER"""
+    """从GSM8K格式提取答案: #### ANSWER（仅数字）"""
     match = re.search(r"####\s*([\d,\.]+)", text)
     if match:
         return match.group(1).replace(',', '')
     return None
+
+def extract_bigmath_answer(text: str) -> Optional[str]:
+    """从BigMath格式提取答案（\\boxed{} 格式）。
+
+    返回完整的 \\boxed{value} 字符串，以便 math_verify.parse() 正确处理
+    所有符号表达式（\\pi, \\sqrt, \\frac 等）。
+
+    兼容旧 #### 格式：若无 \\boxed{}，回退到 #### 提取。
+    """
+    text = text.strip()
+    # 优先匹配 \boxed{...} 格式
+    match = re.search(r'(\\boxed\{.+\})', text, re.DOTALL)
+    if match:
+        return match.group(1)  # 返回完整 \boxed{value}，供 parse() 使用
+    # 兼容旧 #### 格式
+    match = re.search(r"####\s*(.+)", text)
+    if match:
+        return match.group(1).strip()
+    return text if text else None
 
 
 def extract_math_answer(text: str) -> Optional[str]:
@@ -98,6 +143,7 @@ def extract_mbpp_answer(text: str) -> Optional[str]:
 
 EXTRACT_ANSWER_FUNCS = {
     "gsm8k": extract_gsm8k_answer,
+    "bigmath": extract_bigmath_answer,  # 宽松提取，支持LaTeX/区间/复数
     "math": extract_math_answer,
     "mbpp": extract_mbpp_answer,
 }
@@ -154,6 +200,18 @@ class DatasetLoader:
 
         print(f">>> 加载数据集: {config['name']}")
         print(f">>> Split: {split}")
+
+        # 本地 JSON 文件加载（如 bigmath）
+        local_path = config.get('local_path')
+        if local_path:
+            if not os.path.exists(local_path):
+                raise FileNotFoundError(f"本地数据集文件不存在: {local_path}")
+            print(f">>> 加载本地 JSON: {local_path}")
+            data = load_dataset("json", data_files=local_path, split="train")
+            if limit and limit > 0:
+                data = data.select(range(min(limit, len(data))))
+            print(f">>> 数据集大小: {len(data)}")
+            return data
 
         # 从HuggingFace加载
         hf_subsets = config.get('hf_subsets')
