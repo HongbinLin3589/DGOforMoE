@@ -59,13 +59,12 @@ MODEL_DEEPSPEED["qwen"]="zero2"       # 中模型用 zero2
 MODEL_DEEPSPEED["deepseek"]="zero3"   # 较大模型用 zero3
 MODEL_DEEPSPEED["mixtral"]="zero3"    # 大模型用 zero3
 
-# LoRA target_modules 配置 - 排除 router gate 以保持路由稳定性
-# 注意：不使用 all-linear 是为了避免训练 mlp.gate (router)
+# LoRA target_modules 配置 - 包含 router gate 以训练路由器
 declare -A MODEL_TARGET_MODULES
-MODEL_TARGET_MODULES["olmoe"]="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
-MODEL_TARGET_MODULES["qwen"]="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
-MODEL_TARGET_MODULES["deepseek"]="q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
-MODEL_TARGET_MODULES["mixtral"]="q_proj k_proj v_proj o_proj w1 w2 w3"
+MODEL_TARGET_MODULES["olmoe"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["qwen"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["deepseek"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["mixtral"]="gate q_proj k_proj v_proj o_proj w1 w2 w3"
 
 # =============================================================================
 # 参数解析
