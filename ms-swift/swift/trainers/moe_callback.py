@@ -708,7 +708,13 @@ class MoEMonitorCallback(TrainerCallback):
 
             batch_counts += expert_counts
 
-        # Step 2: 更新全局累积
+        # Step 2: 更新全局累积（DDP 多卡：all_reduce 汇总所有进程的计数）
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(batch_counts, op=dist.ReduceOp.SUM)
+        except Exception:
+            pass  # 单卡训练直接跳过
         if self._global_expert_counts is None:
             self._global_expert_counts = torch.zeros(self.moe_config.num_experts)
         self._global_expert_counts += batch_counts
@@ -835,6 +841,8 @@ class MoEMonitorCallback(TrainerCallback):
             for key, value in self._latest_metrics.items():
                 # 添加前缀以便在TensorBoard中分组显示
                 logs[f'moe/{key}'] = value
+            # 清零，防止下次 on_log 重复上报同一步的旧数据
+            self._latest_metrics = {}
 
     def on_train_end(
         self,

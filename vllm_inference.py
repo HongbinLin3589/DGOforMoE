@@ -6,11 +6,15 @@
 # =================================================================================
 import os
 
-# HuggingFace 配置（优先使用环境变量）
+# HuggingFace 配置——路径统一由 scripts/env.sh 管理，此处只做缺失时的警告
+# 正常使用：run_dgo_gen.sh 已 source env.sh，环境变量由 bash 传入
 if 'HF_HOME' not in os.environ:
-    os.environ['HF_HOME'] = '/usr/storage/fwan/huggingface_cache'
+    raise EnvironmentError(
+        "HF_HOME 未设置。请先执行: source scripts/env.sh\n"
+        "或通过 run_dgo_gen.sh 调用本脚本（脚本会自动 source env.sh）。"
+    )
 if 'HF_ENDPOINT' not in os.environ:
-    os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+    os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'  # 镜像源可在此保留默认
 
 import argparse
 import json
@@ -254,6 +258,13 @@ def main(args):
         print(f"❌ 加载数据集失败: {e}")
         return
 
+    # Data Parallel 分片：只处理属于本 shard 的数据
+    if args.shard_id is not None and args.num_shards is not None:
+        total = len(dataset)
+        dataset = dataset.select(range(args.shard_id, total, args.num_shards))
+        print(f">>> Data Parallel: shard {args.shard_id}/{args.num_shards}, "
+              f"处理 {len(dataset)}/{total} 条数据")
+
     # 准备 prompts
     # Base Model模式：直接使用预处理后的文本prompt，不应用chat template
     print(f">>> 准备推理 prompts（Base Model模式：不使用chat template）...")
@@ -351,6 +362,12 @@ if __name__ == "__main__":
                         help="LoRA adapter路径（SFT checkpoint）。如不指定则使用基础模型。")
     parser.add_argument("--max_lora_rank", type=int, default=64,
                         help="LoRA最大rank。默认64。")
+
+    # Data Parallel 分片参数
+    parser.add_argument("--shard_id", type=int, default=None,
+                        help="当前分片ID (0-indexed)。与 --num_shards 配合实现数据并行。")
+    parser.add_argument("--num_shards", type=int, default=None,
+                        help="总分片数。设置后只处理 dataset[shard_id::num_shards] 部分。")
 
     args = parser.parse_args()
 

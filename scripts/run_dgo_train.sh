@@ -51,30 +51,42 @@ MAX_LENGTH["math"]=1024
 MAX_LENGTH["mbpp"]=1024
 MAX_LENGTH["bigmath"]=1024
 
-# 按模型大小调整 batch size
+# 按模型大小调整 batch size (4 GPU, global_batch=256)
 declare -A MODEL_BATCH_SIZE
 MODEL_BATCH_SIZE["olmoe"]=32
+MODEL_BATCH_SIZE["olmoe_instruct"]=32
 MODEL_BATCH_SIZE["qwen"]=32
+MODEL_BATCH_SIZE["qwen3"]=8             # 30B: 显存紧张
+MODEL_BATCH_SIZE["qwen3_instruct"]=8
 MODEL_BATCH_SIZE["deepseek"]=32
 MODEL_BATCH_SIZE["mixtral"]=32
 
 declare -A MODEL_GRAD_ACCUM
-MODEL_GRAD_ACCUM["olmoe"]=1
-MODEL_GRAD_ACCUM["qwen"]=1
-MODEL_GRAD_ACCUM["deepseek"]=1
-MODEL_GRAD_ACCUM["mixtral"]=1
+MODEL_GRAD_ACCUM["olmoe"]=2              # 4 GPU: 32×2×4=256
+MODEL_GRAD_ACCUM["olmoe_instruct"]=2
+MODEL_GRAD_ACCUM["qwen"]=2
+MODEL_GRAD_ACCUM["qwen3"]=8             # 4 GPU: 8×8×4=256
+MODEL_GRAD_ACCUM["qwen3_instruct"]=8
+MODEL_GRAD_ACCUM["deepseek"]=2
+MODEL_GRAD_ACCUM["mixtral"]=2
 
 # DeepSpeed配置
 declare -A MODEL_DEEPSPEED
 MODEL_DEEPSPEED["olmoe"]="zero2"
+MODEL_DEEPSPEED["olmoe_instruct"]="zero2"
 MODEL_DEEPSPEED["qwen"]="zero3"
+MODEL_DEEPSPEED["qwen3"]="zero3"
+MODEL_DEEPSPEED["qwen3_instruct"]="zero3"
 MODEL_DEEPSPEED["deepseek"]="zero3"
 MODEL_DEEPSPEED["mixtral"]="zero3"
 
 # LoRA target_modules 配置 - 包含 router gate 以训练路由器
 declare -A MODEL_TARGET_MODULES
 MODEL_TARGET_MODULES["olmoe"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["olmoe_instruct"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
 MODEL_TARGET_MODULES["qwen"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["qwen3"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["qwen3_instruct"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
 MODEL_TARGET_MODULES["deepseek"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
 MODEL_TARGET_MODULES["mixtral"]="gate q_proj k_proj v_proj o_proj w1 w2 w3"
 
@@ -82,7 +94,7 @@ MODEL_TARGET_MODULES["mixtral"]="gate q_proj k_proj v_proj o_proj w1 w2 w3"
 # DGO特定参数
 # =============================================================================
 DGO_BETA=0.1
-NUM_EPOCHS=5
+NUM_EPOCHS=4
 
 # =============================================================================
 # 参数解析
@@ -197,7 +209,7 @@ echo "  rank: $DEFAULT_LORA_RANK"
 echo "  alpha: $DEFAULT_LORA_ALPHA"
 echo "  dropout: $DEFAULT_LORA_DROPOUT"
 echo "  target_modules: $TARGET_MODULES"
-echo "  (注: 排除 router gate 以保持路由稳定性)"
+echo "  (注: 包含 router gate，训练路由器以产生路由扰动)"
 echo ""
 echo "SFT Checkpoint:"
 if [[ -n "$SFT_CHECKPOINT" ]]; then

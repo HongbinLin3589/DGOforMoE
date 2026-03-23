@@ -631,10 +631,12 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                         raw_state_dict[name] = param.clone()
                 else:
                     # DeepSpeed: use named_parameters + param.data
+                    # Clone to CPU to avoid GPU OOM when training model + vLLM model + clone
+                    # all reside on GPU simultaneously (critical for large MoE models on 40GB GPUs)
                     for name, param in self.model.named_parameters():
                         if parameter_group and name not in parameter_group:
                             continue
-                        raw_state_dict[name] = param.data.clone()
+                        raw_state_dict[name] = param.data.cpu()
             finally:
                 if is_peft and not self._is_fsdp2:
                     with patch_lora_unmerge(self.model):

@@ -47,59 +47,83 @@ MAX_LENGTH["bigmath"]=1024
 # vLLM 配置映射 - 根据模型大小调整
 declare -A VLLM_TP_SIZE
 VLLM_TP_SIZE["olmoe"]=1
+VLLM_TP_SIZE["olmoe_instruct"]=1
 VLLM_TP_SIZE["qwen"]=1
+VLLM_TP_SIZE["qwen3"]=2
+VLLM_TP_SIZE["qwen3_instruct"]=2
 VLLM_TP_SIZE["deepseek"]=2
 VLLM_TP_SIZE["mixtral"]=2
 
 declare -A VLLM_MEM_UTIL
-VLLM_MEM_UTIL["olmoe"]=0.2
+VLLM_MEM_UTIL["olmoe"]=0.4
+VLLM_MEM_UTIL["olmoe_instruct"]=0.4
 VLLM_MEM_UTIL["qwen"]=0.3
+VLLM_MEM_UTIL["qwen3"]=0.3
+VLLM_MEM_UTIL["qwen3_instruct"]=0.3
 VLLM_MEM_UTIL["deepseek"]=0.3
 VLLM_MEM_UTIL["mixtral"]=0.3
 
-# Template 配置映射 - 基础模型使用 default
+# Template 配置映射 - 基础模型用 default，instruct 模型用 auto
 declare -A MODEL_TEMPLATE
 MODEL_TEMPLATE["olmoe"]="default"
+MODEL_TEMPLATE["olmoe_instruct"]="default"
 MODEL_TEMPLATE["qwen"]="default"
+MODEL_TEMPLATE["qwen3"]="default"
+MODEL_TEMPLATE["qwen3_instruct"]="default"
 MODEL_TEMPLATE["deepseek"]="default"
 MODEL_TEMPLATE["mixtral"]="default"
 
-# 按模型大小调整 batch size
+# 按模型大小调整 batch size (pairs/GPU/micro-step, 4 GPU)
 declare -A MODEL_BATCH_SIZE
-MODEL_BATCH_SIZE["olmoe"]=1
-MODEL_BATCH_SIZE["qwen"]=8
-MODEL_BATCH_SIZE["deepseek"]=8
-MODEL_BATCH_SIZE["mixtral"]=2
+MODEL_BATCH_SIZE["olmoe"]=16            # 7B:  16×4×4=256 pairs, 32 unique prompts/step
+MODEL_BATCH_SIZE["olmoe_instruct"]=16
+MODEL_BATCH_SIZE["qwen"]=8             # 14B
+MODEL_BATCH_SIZE["qwen3"]=2            # 30B: 显存紧张
+MODEL_BATCH_SIZE["qwen3_instruct"]=2
+MODEL_BATCH_SIZE["deepseek"]=8         # 16B
+MODEL_BATCH_SIZE["mixtral"]=2          # 47B
 
 declare -A MODEL_GRAD_ACCUM
 MODEL_GRAD_ACCUM["olmoe"]=4
+MODEL_GRAD_ACCUM["olmoe_instruct"]=4
 MODEL_GRAD_ACCUM["qwen"]=4
+MODEL_GRAD_ACCUM["qwen3"]=16
+MODEL_GRAD_ACCUM["qwen3_instruct"]=16
 MODEL_GRAD_ACCUM["deepseek"]=4
 MODEL_GRAD_ACCUM["mixtral"]=16
 
-# 按模型大小选择 deepspeed (GRPO 用 zero2 更稳定)
+# 按模型大小选择 deepspeed
 declare -A MODEL_DEEPSPEED
 MODEL_DEEPSPEED["olmoe"]="zero2"
+MODEL_DEEPSPEED["olmoe_instruct"]="zero2"
 MODEL_DEEPSPEED["qwen"]="zero2"
+MODEL_DEEPSPEED["qwen3"]="zero3"            # 30B 需要分片
+MODEL_DEEPSPEED["qwen3_instruct"]="zero3"
 MODEL_DEEPSPEED["deepseek"]="zero2"
 MODEL_DEEPSPEED["mixtral"]="zero2"
 
 # GRPO 特定参数
 declare -A MODEL_NUM_GENERATIONS
-MODEL_NUM_GENERATIONS["olmoe"]=2
+MODEL_NUM_GENERATIONS["olmoe"]=8
+MODEL_NUM_GENERATIONS["olmoe_instruct"]=8
 MODEL_NUM_GENERATIONS["qwen"]=8
+MODEL_NUM_GENERATIONS["qwen3"]=8
+MODEL_NUM_GENERATIONS["qwen3_instruct"]=8
 MODEL_NUM_GENERATIONS["deepseek"]=8
 MODEL_NUM_GENERATIONS["mixtral"]=8
 
 # LoRA target_modules 配置 - 包含 router gate 以训练路由器
 declare -A MODEL_TARGET_MODULES
 MODEL_TARGET_MODULES["olmoe"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["olmoe_instruct"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
 MODEL_TARGET_MODULES["qwen"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["qwen3"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["qwen3_instruct"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
 MODEL_TARGET_MODULES["deepseek"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
 MODEL_TARGET_MODULES["mixtral"]="gate q_proj k_proj v_proj o_proj w1 w2 w3"
 
 BETA=0.01
-NUM_EPOCHS=5
+NUM_EPOCHS=4
 
 # =============================================================================
 # 参数解析
@@ -136,7 +160,7 @@ case "$DATASET_KEY" in
     math)
         DATASET_PATH=$(get_dataset_path math)
         REWARD_FUNC="accuracy"
-        COLUMNS='{"problem": "query"}'
+        COLUMNS='{"problem": "query", "solution": "solution"}'
         ;;
     mbpp)
         DATASET_PATH=$(get_dataset_path mbpp)
@@ -201,7 +225,7 @@ echo "vllm_gpu_memory_utilization: $VLLM_MEM"
 echo ""
 echo "LoRA 配置:"
 echo "  target_modules: $TARGET_MODULES"
-echo "  (注: 排除 router gate 以保持路由稳定性)"
+echo "  (注: 包含 router gate，训练路由器以产生路由扰动)"
 echo ""
 echo "MoE 配置:"
 echo "  router_aux_loss_coef: ${ROUTER_AUX_LOSS_COEF:-$DEFAULT_ROUTER_AUX_LOSS_COEF}"

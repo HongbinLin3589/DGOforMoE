@@ -57,13 +57,19 @@ DEFAULT_TP_SIZE=${TP_SIZE:-$NUM_GPUS}
 
 declare -A VLLM_TP_SIZE
 VLLM_TP_SIZE["olmoe"]=$DEFAULT_TP_SIZE
+VLLM_TP_SIZE["olmoe_instruct"]=$DEFAULT_TP_SIZE
 VLLM_TP_SIZE["qwen"]=$DEFAULT_TP_SIZE
+VLLM_TP_SIZE["qwen3"]=$DEFAULT_TP_SIZE
+VLLM_TP_SIZE["qwen3_instruct"]=$DEFAULT_TP_SIZE
 VLLM_TP_SIZE["deepseek"]=$DEFAULT_TP_SIZE
 VLLM_TP_SIZE["mixtral"]=$DEFAULT_TP_SIZE
 
 declare -A VLLM_MEM_UTIL
 VLLM_MEM_UTIL["olmoe"]=${VLLM_MEM:-0.85}
+VLLM_MEM_UTIL["olmoe_instruct"]=${VLLM_MEM:-0.85}
 VLLM_MEM_UTIL["qwen"]=${VLLM_MEM:-0.85}
+VLLM_MEM_UTIL["qwen3"]=${VLLM_MEM:-0.85}
+VLLM_MEM_UTIL["qwen3_instruct"]=${VLLM_MEM:-0.85}
 VLLM_MEM_UTIL["deepseek"]=${VLLM_MEM:-0.85}
 VLLM_MEM_UTIL["mixtral"]=${VLLM_MEM:-0.85}
 
@@ -85,14 +91,20 @@ TOP_P=0.95
 # 批量推理优化参数
 # =============================================================================
 declare -A MAX_NUM_SEQS
-MAX_NUM_SEQS["olmoe"]=256
+MAX_NUM_SEQS["olmoe"]=512
+MAX_NUM_SEQS["olmoe_instruct"]=512
 MAX_NUM_SEQS["qwen"]=128
+MAX_NUM_SEQS["qwen3"]=64
+MAX_NUM_SEQS["qwen3_instruct"]=64
 MAX_NUM_SEQS["deepseek"]=128
 MAX_NUM_SEQS["mixtral"]=64
 
 declare -A MAX_BATCHED_TOKENS
-MAX_BATCHED_TOKENS["olmoe"]=16384
+MAX_BATCHED_TOKENS["olmoe"]=32768
+MAX_BATCHED_TOKENS["olmoe_instruct"]=32768
 MAX_BATCHED_TOKENS["qwen"]=12288
+MAX_BATCHED_TOKENS["qwen3"]=8192
+MAX_BATCHED_TOKENS["qwen3_instruct"]=8192
 MAX_BATCHED_TOKENS["deepseek"]=10240
 MAX_BATCHED_TOKENS["mixtral"]=8192
 
@@ -182,36 +194,164 @@ echo ""
 # =============================================================================
 echo "🚀 开始DGO数据生成 (vLLM inference)..."
 
-# 构建 LoRA 参数
+# 处理 SFT checkpoint：vLLM 不支持 MoE 模型的 LoRA，需要先合并
 LORA_ARG=""
+INFERENCE_MODEL="$MODEL_PATH"
 if [[ -n "$SFT_CHECKPOINT" ]]; then
-    if [[ -d "$SFT_CHECKPOINT" ]]; then
-        LORA_ARG="--lora_path $SFT_CHECKPOINT"
-        echo "📦 加载 SFT checkpoint: $SFT_CHECKPOINT"
-    else
+    if [[ ! -d "$SFT_CHECKPOINT" ]]; then
         echo "❌ SFT checkpoint 路径不存在: $SFT_CHECKPOINT"
         exit 1
     fi
+
+    # vLLM 不支持 OLMoE/MoE 模型的 LoRA，需要先合并 adapter 到 base model
+    MERGED_DIR="${SFT_CHECKPOINT}-merged"
+    if [[ -d "$MERGED_DIR" && -f "$MERGED_DIR/config.json" ]]; then
+        echo "📦 发现已合并的模型: $MERGED_DIR (跳过合并)"
+    else
+        echo "📦 合并 SFT LoRA adapter 到 base model..."
+        echo "   checkpoint: $SFT_CHECKPOINT"
+        echo "   输出目录: $MERGED_DIR"
+        swift export \
+            --ckpt_dir "$SFT_CHECKPOINT" \
+            --merge_lora true \
+            --output_dir "$MERGED_DIR"
+        if [[ ! -d "$MERGED_DIR" ]]; then
+            echo "❌ 合并失败，输出目录不存在: $MERGED_DIR"
+            exit 1
+        fi
+        echo "✅ LoRA 合并完成"
+    fi
+    INFERENCE_MODEL="$MERGED_DIR"
+    echo "📦 使用合并后的模型: $INFERENCE_MODEL"
 fi
 
-python "${DGO_ROOT}/vllm_inference.py" \
-    --model_name "$MODEL_PATH" \
-    $LORA_ARG \
-    --dataset "$DATASET_KEY" \
-    --dataset_split train \
-    --n "$NUM_GENERATIONS" \
-    --temperature "$TEMPERATURE" \
-    --top_p "$TOP_P" \
-    --max_tokens "$MAX_LEN" \
-    --tensor_parallel_size "$VLLM_TP" \
-    --gpu_memory_utilization "$VLLM_MEM" \
-    --max_num_seqs "$MAX_SEQS" \
-    --max_num_batched_tokens "$MAX_TOKENS_BATCH" \
-    --swap_space "$SWAP_SPACE" \
-    --output_file "$OUTPUT_FILE" \
-    --stop '</answer>' \
-    --stop $'\nQ:' \
-    --stop $'\n\nQ:'
+# 判断是否使用 Data Parallel（TP=1 多进程）还是 Tensor Parallel
+# 小模型（单卡可放下）用 DP 更快：每张卡独立跑模型，处理不同数据
+USE_DATA_PARALLEL=${USE_DATA_PARALLEL:-"auto"}
+if [[ "$USE_DATA_PARALLEL" == "auto" ]]; then
+    # OLMoE 等小模型（<15B）用 DP，大模型用 TP
+    case "$MODEL_KEY" in
+        olmoe|olmoe_instruct) USE_DATA_PARALLEL="true" ;;   # OLMoE 7B → 单卡可放，用 DP
+        *)                    USE_DATA_PARALLEL="false" ;;  # 其他模型 → 需要 TP
+    esac
+fi
+
+if [[ "$USE_DATA_PARALLEL" == "true" && "$NUM_GPUS" -gt 1 ]]; then
+    echo ">>> 使用 Data Parallel 模式: ${NUM_GPUS} 个独立 vLLM 进程 (TP=1)"
+
+    # 获取 GPU 列表
+    IFS=',' read -ra GPU_LIST <<< "$CUDA_VISIBLE_DEVICES"
+    PIDS=()
+
+    for i in $(seq 0 $((NUM_GPUS - 1))); do
+        SHARD_FILE="${OUTPUT_FILE%.json}_shard${i}.json"
+        echo "  启动 shard $i/${NUM_GPUS} on GPU ${GPU_LIST[$i]} → $SHARD_FILE"
+
+        CUDA_VISIBLE_DEVICES="${GPU_LIST[$i]}" python "${DGO_ROOT}/vllm_inference.py" \
+            --model_name "$INFERENCE_MODEL" \
+            --dataset "$DATASET_KEY" \
+            --dataset_split train \
+            --n "$NUM_GENERATIONS" \
+            --temperature "$TEMPERATURE" \
+            --top_p "$TOP_P" \
+            --max_tokens "$MAX_LEN" \
+            --tensor_parallel_size 1 \
+            --gpu_memory_utilization "$VLLM_MEM" \
+            --max_num_seqs "$MAX_SEQS" \
+            --max_num_batched_tokens "$MAX_TOKENS_BATCH" \
+            --swap_space "$SWAP_SPACE" \
+            --output_file "$SHARD_FILE" \
+            --shard_id "$i" \
+            --num_shards "$NUM_GPUS" \
+            --stop '</answer>' \
+            --stop $'\nQ:' \
+            --stop $'\n\nQ:' &
+
+        PIDS+=($!)
+    done
+
+    # 等待所有进程完成（轮询显示进度，每张卡数据量可能不均匀）
+    echo ">>> 等待 ${NUM_GPUS} 个推理进程完成..."
+    START_WAIT=$(date +%s)
+    FAIL=0
+    while true; do
+        RUNNING=0
+        DONE_LIST=""
+        RUNNING_LIST=""
+        for i in "${!PIDS[@]}"; do
+            if kill -0 "${PIDS[$i]}" 2>/dev/null; then
+                RUNNING=$((RUNNING + 1))
+                RUNNING_LIST="${RUNNING_LIST} shard${i}(GPU${GPU_LIST[$i]})"
+            else
+                DONE_LIST="${DONE_LIST} shard${i}"
+            fi
+        done
+
+        if [[ "$RUNNING" -eq 0 ]]; then
+            break
+        fi
+
+        ELAPSED=$(( $(date +%s) - START_WAIT ))
+        ELAPSED_MIN=$((ELAPSED / 60))
+        ELAPSED_SEC=$((ELAPSED % 60))
+        echo "  [${ELAPSED_MIN}m${ELAPSED_SEC}s] 完成: $((NUM_GPUS - RUNNING))/${NUM_GPUS} | 仍在运行:${RUNNING_LIST}"
+        sleep 30
+    done
+
+    # 检查各进程退出状态
+    for i in "${!PIDS[@]}"; do
+        if ! wait "${PIDS[$i]}"; then
+            echo "❌ shard${i} (PID ${PIDS[$i]}) 失败"
+            FAIL=1
+        fi
+    done
+
+    TOTAL_WAIT=$(( $(date +%s) - START_WAIT ))
+    echo ">>> 所有进程完成，耗时 $((TOTAL_WAIT / 60))m$((TOTAL_WAIT % 60))s"
+
+    if [[ "$FAIL" -eq 1 ]]; then
+        echo "❌ 部分推理进程失败，退出"
+        exit 1
+    fi
+
+    # 合并所有分片结果
+    echo ">>> 合并 ${NUM_GPUS} 个分片..."
+    python -c "
+import json, glob, sys
+shards = sorted(glob.glob('${OUTPUT_FILE%.json}_shard*.json'))
+merged = []
+for s in shards:
+    with open(s) as f:
+        merged.extend(json.load(f))
+with open('${OUTPUT_FILE}', 'w') as f:
+    json.dump(merged, f, ensure_ascii=False, indent=2)
+print(f'合并完成: {len(shards)} 个分片 → {len(merged)} 条数据')
+# 清理分片文件
+import os
+for s in shards:
+    os.remove(s)
+"
+
+else
+    echo ">>> 使用 Tensor Parallel 模式: TP=${VLLM_TP}"
+    python "${DGO_ROOT}/vllm_inference.py" \
+        --model_name "$INFERENCE_MODEL" \
+        --dataset "$DATASET_KEY" \
+        --dataset_split train \
+        --n "$NUM_GENERATIONS" \
+        --temperature "$TEMPERATURE" \
+        --top_p "$TOP_P" \
+        --max_tokens "$MAX_LEN" \
+        --tensor_parallel_size "$VLLM_TP" \
+        --gpu_memory_utilization "$VLLM_MEM" \
+        --max_num_seqs "$MAX_SEQS" \
+        --max_num_batched_tokens "$MAX_TOKENS_BATCH" \
+        --swap_space "$SWAP_SPACE" \
+        --output_file "$OUTPUT_FILE" \
+        --stop '</answer>' \
+        --stop $'\nQ:' \
+        --stop $'\n\nQ:'
+fi
 
 echo ""
 echo "============================================================"

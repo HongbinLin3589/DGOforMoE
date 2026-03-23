@@ -39,30 +39,42 @@ MAX_LENGTH["math"]=1024
 MAX_LENGTH["mbpp"]=1024
 MAX_LENGTH["bigmath"]=1024
 
-# 按模型大小调整 batch size (保持 global batch = 256)
+# 按模型大小调整 batch size (保持 global batch = 256, 4 GPU)
 declare -A MODEL_BATCH_SIZE
-MODEL_BATCH_SIZE["olmoe"]=32      # 小模型，batch=32, grad_accum=1 → 32×1×8=256
-MODEL_BATCH_SIZE["qwen"]=8        # 中模型，batch=8, grad_accum=4 → 8×4×8=256
-MODEL_BATCH_SIZE["deepseek"]=8    # 中模型，batch=8, grad_accum=4 → 8×4×8=256
-MODEL_BATCH_SIZE["mixtral"]=4     # 大模型，batch=4, grad_accum=8 → 4×8×8=256
+MODEL_BATCH_SIZE["olmoe"]=32            # 7B:  32×2×4=256
+MODEL_BATCH_SIZE["olmoe_instruct"]=32   # 7B:  同 olmoe
+MODEL_BATCH_SIZE["qwen"]=8             # 14B: 8×4×4=128 (显存受限)
+MODEL_BATCH_SIZE["qwen3"]=4            # 30B: 4×8×4=128
+MODEL_BATCH_SIZE["qwen3_instruct"]=4   # 30B: 同 qwen3
+MODEL_BATCH_SIZE["deepseek"]=8         # 16B: 8×4×4=128
+MODEL_BATCH_SIZE["mixtral"]=4          # 47B: 4×8×4=128
 
 declare -A MODEL_GRAD_ACCUM
-MODEL_GRAD_ACCUM["olmoe"]=1
+MODEL_GRAD_ACCUM["olmoe"]=2
+MODEL_GRAD_ACCUM["olmoe_instruct"]=2
 MODEL_GRAD_ACCUM["qwen"]=4
+MODEL_GRAD_ACCUM["qwen3"]=8
+MODEL_GRAD_ACCUM["qwen3_instruct"]=8
 MODEL_GRAD_ACCUM["deepseek"]=4
 MODEL_GRAD_ACCUM["mixtral"]=8
 
 # 按模型大小选择 deepspeed
 declare -A MODEL_DEEPSPEED
-MODEL_DEEPSPEED["olmoe"]="zero2"      # 小模型用 zero2
-MODEL_DEEPSPEED["qwen"]="zero2"       # 中模型用 zero2
-MODEL_DEEPSPEED["deepseek"]="zero3"   # 较大模型用 zero3
-MODEL_DEEPSPEED["mixtral"]="zero3"    # 大模型用 zero3
+MODEL_DEEPSPEED["olmoe"]="zero2"            # 7B  → 单卡可放
+MODEL_DEEPSPEED["olmoe_instruct"]="zero2"
+MODEL_DEEPSPEED["qwen"]="zero2"             # 14B → 单卡勉强
+MODEL_DEEPSPEED["qwen3"]="zero3"            # 30B → 需要分片
+MODEL_DEEPSPEED["qwen3_instruct"]="zero3"
+MODEL_DEEPSPEED["deepseek"]="zero3"         # 16B
+MODEL_DEEPSPEED["mixtral"]="zero3"          # 47B
 
 # LoRA target_modules 配置 - 包含 router gate 以训练路由器
 declare -A MODEL_TARGET_MODULES
 MODEL_TARGET_MODULES["olmoe"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["olmoe_instruct"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
 MODEL_TARGET_MODULES["qwen"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["qwen3"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+MODEL_TARGET_MODULES["qwen3_instruct"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
 MODEL_TARGET_MODULES["deepseek"]="gate q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
 MODEL_TARGET_MODULES["mixtral"]="gate q_proj k_proj v_proj o_proj w1 w2 w3"
 
@@ -87,8 +99,8 @@ fi
 
 MAX_LEN="${MAX_LENGTH[$DATASET_KEY]}"
 
-# 获取系统提示
-SYSTEM_PROMPT=$(get_system_prompt "$DATASET_KEY")
+# 获取系统提示（SFT 不要求 <thinking>，只要求 <answer> 格式）
+SYSTEM_PROMPT=$(get_sft_system_prompt "$DATASET_KEY")
 
 # 数据集列映射配置
 COLUMNS_MAPPING=""
@@ -158,7 +170,7 @@ echo "  rank: $DEFAULT_LORA_RANK"
 echo "  alpha: $DEFAULT_LORA_ALPHA"
 echo "  dropout: $DEFAULT_LORA_DROPOUT"
 echo "  target_modules: $TARGET_MODULES"
-echo "  (注: 排除 router gate 以保持路由稳定性)"
+echo "  (注: 包含 router gate，训练路由器以产生路由扰动)"
 echo ""
 echo "MoE 配置:"
 echo "  router_aux_loss_coef: ${ROUTER_AUX_LOSS_COEF:-$DEFAULT_ROUTER_AUX_LOSS_COEF}"
@@ -177,6 +189,8 @@ fi
 
 swift sft \
     --model "$MODEL_PATH" \
+    --template default \
+    --template_backend swift \
     --attn_impl sdpa \
     --system "$SYSTEM_PROMPT" \
     --dataset "$DATASET_PATH" \

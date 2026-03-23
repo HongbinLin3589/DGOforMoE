@@ -172,6 +172,10 @@ class SwiftRLHF(SwiftSft):
             assert args.rlhf_type in {'dpo', 'kto',
                                       'grpo'}, 'Currently, only DPO, KTO, and GRPO support `ref_adapters`.'
             args.training_args.ref_adapter_name = 'ref_adapter'
+            # PEFT's load_adapter calls set_adapter('ref_adapter') internally, which freezes the
+            # 'default' (policy) adapter. Switch back to 'default' to restore trainable parameters.
+            if hasattr(model, 'set_adapter'):
+                model.set_adapter('default')
         return model
 
     def _prepare_template(self) -> None:

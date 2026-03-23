@@ -50,17 +50,15 @@ DATASET_CONFIGS = {
     "bigmath": {
         "name": "BigMath-Bimodal",
         "description": "Big-Math-RL-Verified 双峰子集 (60%简单+40%困难，10K条，\\boxed{}格式)",
-        "local_path": os.environ.get(
-            "BIGMATH_LOCAL",
-            "/usr/storage/fwan/huggingface_cache/datasets/bigmath_bimodal_10k.json"
-        ),
+        "local_path": os.environ.get("BIGMATH_LOCAL"),       # 由 env.sh 的 BIGMATH_LOCAL 设置
+        "local_test_path": os.environ.get("BIGMATH_LOCAL_TEST"),  # 由 env.sh 的 BIGMATH_LOCAL_TEST 设置
         "hf_name": None,
         "hf_config": None,
         "question_field": "question",
         "answer_field": "answer",          # "\\boxed{value}" 格式，math_verify 可正确解析符号答案
         "extract_answer_func": "extract_bigmath_answer",
         "max_length": 1024,
-        "supported_splits": ["train"],
+        "supported_splits": ["train", "test"],
     },
     "mbpp": {
         "name": "MBPP",
@@ -73,9 +71,7 @@ DATASET_CONFIGS = {
         "extract_answer_func": "extract_mbpp_answer",
         "max_length": 2048,
         "supported_splits": ["train", "test", "validation", "prompt"],
-        # NOTE: MS-SWIFT training requires preprocessed dataset at:
-        # /usr/commondata/public/hf_hub/cc/DGO/datasets/mbpp_preprocessed
-        # Columns renamed: text->problem, code->solution (to match MS-SWIFT's ResponsePreprocessor)
+        # NOTE: MS-SWIFT training uses --columns to rename text->query for GRPO/DGO
     },
 }
 
@@ -204,6 +200,9 @@ class DatasetLoader:
         # 本地 JSON 文件加载（如 bigmath）
         local_path = config.get('local_path')
         if local_path:
+            # test split 使用单独的测试文件（若配置了 local_test_path）
+            if split == "test" and config.get('local_test_path'):
+                local_path = config['local_test_path']
             if not os.path.exists(local_path):
                 raise FileNotFoundError(f"本地数据集文件不存在: {local_path}")
             print(f">>> 加载本地 JSON: {local_path}")

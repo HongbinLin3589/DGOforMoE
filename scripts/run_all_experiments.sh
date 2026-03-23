@@ -14,12 +14,12 @@
 
 set -e
 
-BASE_DIR="/usr/commondata/public/hf_hub/cc/DGO"
-cd "$BASE_DIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="/wutailin/DGO"
 
 # 实验配置
 MODELS=("olmoe" "qwen" "deepseek" "mixtral")
-DATASETS=("gsm8k" "math" "mbpp")
+DATASETS=("gsm8k" "math" "mbpp" "bigmath")
 
 # 解析参数
 MODE="${1:-all}"
@@ -39,7 +39,7 @@ run_sft() {
     log "开始 SFT: model=$model, dataset=$dataset"
     log "=========================================="
 
-    if bash scripts/run_sft_swift.sh "$model" "$dataset"; then
+    if bash "$SCRIPT_DIR/run_sft_swift.sh" "$model" "$dataset"; then
         log "✅ SFT 完成: model=$model, dataset=$dataset"
     else
         log "❌ SFT 失败: model=$model, dataset=$dataset"
@@ -53,7 +53,7 @@ run_grpo() {
     log "开始 GRPO: model=$model, dataset=$dataset"
     log "=========================================="
 
-    if bash scripts/run_grpo_swift.sh "$model" "$dataset"; then
+    if bash "$SCRIPT_DIR/run_grpo_swift.sh" "$model" "$dataset"; then
         log "✅ GRPO 完成: model=$model, dataset=$dataset"
     else
         log "❌ GRPO 失败: model=$model, dataset=$dataset"

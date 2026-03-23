@@ -109,7 +109,8 @@ if [[ "$MODE" == "full" || "$MODE" == "train" ]]; then
 
     # 检查数据是否存在 (train-only模式)
     if [[ "$MODE" == "train" ]]; then
-        DGO_DATA_FILE="$BASE_DIR/dgo_cache/dgo_data_${MODEL_KEY}_${DATASET_KEY}.json"
+        source "$SCRIPT_DIR/env.sh" 2>/dev/null || true
+        DGO_DATA_FILE="${DGO_CACHE:-/wutailin/DGO/dgo_cache}/dgo_data_${MODEL_KEY}_${DATASET_KEY}.json"
         if [[ ! -f "$DGO_DATA_FILE" ]]; then
             echo "❌ DGO数据文件不存在: $DGO_DATA_FILE"
             echo "请先运行生成: bash $0 $MODEL_KEY $DATASET_KEY gen"
