@@ -120,8 +120,81 @@ def _patch_olmoe_load_balancing_loss():
         logger.warning(f'⚠️  Failed to patch OLMoE load_balancing_loss_func: {e}')
 
 
-# Apply patch on module load
+def _patch_qwen2moe_load_balancing_loss():
+    """Patch Qwen2-MoE load_balancing_loss_func to fix the Expert Parallelism bug."""
+    try:
+        from transformers.models.qwen2_moe import modeling_qwen2_moe
+        from typing import Optional, Union
+
+        def load_balancing_loss_func_fixed(
+            gate_logits: Union[torch.Tensor, tuple, None],
+            num_experts: Optional[int] = None,
+            top_k=2,
+            attention_mask: Optional[torch.Tensor] = None,
+        ) -> Union[torch.Tensor, int]:
+            """Fixed version without EP rank offset for standard DDP training."""
+            if gate_logits is None or not isinstance(gate_logits, tuple):
+                return 0
+
+            compute_device = gate_logits[0].device
+            concatenated_gate_logits = torch.cat(
+                [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
+            )
+
+            routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+            _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+            expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+
+            use_attention_mask = (
+                attention_mask is not None
+                and attention_mask.numel() > 0
+                and len(attention_mask.shape) == 2
+            )
+
+            if not use_attention_mask:
+                tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+                router_prob_per_expert = torch.mean(routing_weights, dim=0)
+            else:
+                try:
+                    batch_size, sequence_length = attention_mask.shape
+                    num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+                    expert_attention_mask = (
+                        attention_mask[None, :, :, None, None]
+                        .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
+                        .reshape(-1, top_k, num_experts)
+                        .to(compute_device)
+                    )
+                    tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
+                        expert_attention_mask, dim=0
+                    )
+                    router_per_expert_attention_mask = (
+                        attention_mask[None, :, :, None]
+                        .expand((num_hidden_layers, batch_size, sequence_length, routing_weights.shape[1]))
+                        .reshape(-1, routing_weights.shape[1])
+                        .to(compute_device)
+                    )
+                    router_prob_per_expert = torch.sum(
+                        routing_weights * router_per_expert_attention_mask, dim=0
+                    ) / torch.sum(router_per_expert_attention_mask, dim=0)
+                except (ValueError, RuntimeError):
+                    tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+                    router_prob_per_expert = torch.mean(routing_weights, dim=0)
+
+            # FIX: Remove EP rank offset - in standard DDP all GPUs have all experts
+            overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+            return overall_loss * num_experts
+
+        modeling_qwen2_moe.load_balancing_loss_func = load_balancing_loss_func_fixed
+        logger.info('✅ Patched Qwen2-MoE load_balancing_loss_func for DeepSpeed ZeRO compatibility')
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f'⚠️  Failed to patch Qwen2-MoE load_balancing_loss_func: {e}')
+
+
+# Apply patches on module load
 _patch_olmoe_load_balancing_loss()
+_patch_qwen2moe_load_balancing_loss()
 
 
 class Trainer(SwiftMixin, DataLoaderMixin, HfTrainer):

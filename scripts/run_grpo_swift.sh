@@ -57,11 +57,11 @@ VLLM_TP_SIZE["mixtral"]=2
 declare -A VLLM_MEM_UTIL
 VLLM_MEM_UTIL["olmoe"]=0.4
 VLLM_MEM_UTIL["olmoe_instruct"]=0.4
-VLLM_MEM_UTIL["qwen"]=0.3
-VLLM_MEM_UTIL["qwen3"]=0.3
-VLLM_MEM_UTIL["qwen3_instruct"]=0.3
-VLLM_MEM_UTIL["deepseek"]=0.3
-VLLM_MEM_UTIL["mixtral"]=0.3
+VLLM_MEM_UTIL["qwen"]=0.4             # A100 80G 显存充足，可给 vLLM 更多空间
+VLLM_MEM_UTIL["qwen3"]=0.4
+VLLM_MEM_UTIL["qwen3_instruct"]=0.4
+VLLM_MEM_UTIL["deepseek"]=0.4
+VLLM_MEM_UTIL["mixtral"]=0.4
 
 # Template 配置映射 - 基础模型用 default，instruct 模型用 auto
 declare -A MODEL_TEMPLATE
@@ -73,24 +73,25 @@ MODEL_TEMPLATE["qwen3_instruct"]="default"
 MODEL_TEMPLATE["deepseek"]="default"
 MODEL_TEMPLATE["mixtral"]="default"
 
-# 按模型大小调整 batch size (pairs/GPU/micro-step, 4 GPU)
+# 按模型大小调整 batch size
+# A100 80G × 4 卡：global batch = per_device × accum × 4 = 256
 declare -A MODEL_BATCH_SIZE
-MODEL_BATCH_SIZE["olmoe"]=16            # 7B:  16×4×4=256 pairs, 32 unique prompts/step
+MODEL_BATCH_SIZE["olmoe"]=16            # 7B:  16×4×4=256  (A100 80G × 4)
 MODEL_BATCH_SIZE["olmoe_instruct"]=16
-MODEL_BATCH_SIZE["qwen"]=8             # 14B
-MODEL_BATCH_SIZE["qwen3"]=2            # 30B: 显存紧张
-MODEL_BATCH_SIZE["qwen3_instruct"]=2
-MODEL_BATCH_SIZE["deepseek"]=8         # 16B
-MODEL_BATCH_SIZE["mixtral"]=2          # 47B
+MODEL_BATCH_SIZE["qwen"]=16            # 14B: 16×4×4=256  (A100 80G × 4)
+MODEL_BATCH_SIZE["qwen3"]=4            # 30B: 4×8×4=128   (A100 80G × 4)
+MODEL_BATCH_SIZE["qwen3_instruct"]=4
+MODEL_BATCH_SIZE["deepseek"]=16        # 16B: 16×4×4=256  (A100 80G × 4)
+MODEL_BATCH_SIZE["mixtral"]=4          # 47B: 4×8×4=128   (A100 80G × 4)
 
 declare -A MODEL_GRAD_ACCUM
 MODEL_GRAD_ACCUM["olmoe"]=4
 MODEL_GRAD_ACCUM["olmoe_instruct"]=4
 MODEL_GRAD_ACCUM["qwen"]=4
-MODEL_GRAD_ACCUM["qwen3"]=16
-MODEL_GRAD_ACCUM["qwen3_instruct"]=16
+MODEL_GRAD_ACCUM["qwen3"]=8
+MODEL_GRAD_ACCUM["qwen3_instruct"]=8
 MODEL_GRAD_ACCUM["deepseek"]=4
-MODEL_GRAD_ACCUM["mixtral"]=16
+MODEL_GRAD_ACCUM["mixtral"]=8
 
 # 按模型大小选择 deepspeed
 declare -A MODEL_DEEPSPEED
@@ -305,7 +306,6 @@ swift rlhf \
     --eval_strategy steps \
     --eval_steps 100 \
     --save_steps 100 \
-    --save_total_limit 10 \
     --logging_steps 10 \
     --warmup_ratio $DEFAULT_WARMUP_RATIO \
     --dataloader_num_workers 0 \

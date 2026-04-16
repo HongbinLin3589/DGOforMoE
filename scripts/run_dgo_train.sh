@@ -283,7 +283,6 @@ swift rlhf \
     --eval_strategy steps \
     --eval_steps 100 \
     --save_steps 100 \
-    --save_total_limit 10 \
     --logging_steps 10 \
     --dataloader_num_workers 4 \
     \

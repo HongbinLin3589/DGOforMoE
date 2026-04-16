@@ -39,20 +39,21 @@ MAX_LENGTH["math"]=1024
 MAX_LENGTH["mbpp"]=1024
 MAX_LENGTH["bigmath"]=1024
 
-# 按模型大小调整 batch size (保持 global batch = 256, 4 GPU)
+# 按模型大小调整 batch size
+# A100 80G × 4 卡：global batch = per_device × accum × 4 = 256
 declare -A MODEL_BATCH_SIZE
-MODEL_BATCH_SIZE["olmoe"]=32            # 7B:  32×2×4=256
+MODEL_BATCH_SIZE["olmoe"]=32            # 7B:  32×2×4=256  (A100 80G × 4)
 MODEL_BATCH_SIZE["olmoe_instruct"]=32   # 7B:  同 olmoe
-MODEL_BATCH_SIZE["qwen"]=8             # 14B: 8×4×4=128 (显存受限)
-MODEL_BATCH_SIZE["qwen3"]=4            # 30B: 4×8×4=128
-MODEL_BATCH_SIZE["qwen3_instruct"]=4   # 30B: 同 qwen3
-MODEL_BATCH_SIZE["deepseek"]=8         # 16B: 8×4×4=128
-MODEL_BATCH_SIZE["mixtral"]=4          # 47B: 4×8×4=128
+MODEL_BATCH_SIZE["qwen"]=32            # 14B: 32×2×4=256  (A100 80G × 4)
+MODEL_BATCH_SIZE["qwen3"]=8            # 30B: 8×8×4=256   (A100 80G × 4)
+MODEL_BATCH_SIZE["qwen3_instruct"]=8   # 30B: 同 qwen3
+MODEL_BATCH_SIZE["deepseek"]=16        # 16B: 16×4×4=256  (A100 80G × 4)
+MODEL_BATCH_SIZE["mixtral"]=8          # 47B: 8×8×4=256   (A100 80G × 4)
 
 declare -A MODEL_GRAD_ACCUM
 MODEL_GRAD_ACCUM["olmoe"]=2
 MODEL_GRAD_ACCUM["olmoe_instruct"]=2
-MODEL_GRAD_ACCUM["qwen"]=4
+MODEL_GRAD_ACCUM["qwen"]=2
 MODEL_GRAD_ACCUM["qwen3"]=8
 MODEL_GRAD_ACCUM["qwen3_instruct"]=8
 MODEL_GRAD_ACCUM["deepseek"]=4
@@ -99,8 +100,8 @@ fi
 
 MAX_LEN="${MAX_LENGTH[$DATASET_KEY]}"
 
-# 获取系统提示（SFT 不要求 <thinking>，只要求 <answer> 格式）
-SYSTEM_PROMPT=$(get_sft_system_prompt "$DATASET_KEY")
+# 获取系统提示（SFT / GRPO / DGO 统一使用 get_system_prompt，no-CoT 格式：仅 <answer>\boxed{}）
+SYSTEM_PROMPT=$(get_system_prompt "$DATASET_KEY")
 
 # 数据集列映射配置
 COLUMNS_MAPPING=""
@@ -223,7 +224,6 @@ swift sft \
     --eval_strategy steps \
     --eval_steps 100 \
     --save_steps 100 \
-    --save_total_limit 10 \
     --logging_steps 10 \
     \
     --dataloader_num_workers 4 \

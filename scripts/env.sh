@@ -31,11 +31,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # =============================================================================
 # HuggingFace 配置
 # =============================================================================
-export HF_HOME="/wutailin/hf_hub"
+export HF_HOME="/usr/storage/fwan/huggingface_cache"
 export HF_HUB_CACHE="${HF_HOME}/hub"
 export HF_ENDPOINT="https://hf-mirror.com"
 export USE_HF=1
-export HF_TOKEN="your HF_TOKEN"
+export HF_TOKEN=""  # 公开模型无需 token；如需下载 gated 模型请填写
 
 # =============================================================================
 # 模型路径（本地缓存）
@@ -49,7 +49,7 @@ export DEEPSEEK_MOE_MODEL="${MODEL_CACHE}/models--deepseek-ai--deepseek-moe-16b-
 export MIXTRAL_MODEL="${MODEL_CACHE}/models--mistralai--Mixtral-8x7B-v0.1/snapshots/fc7ac94680e38d7348cfa806e51218e6273104b0"
 
 # MoE 模型路径 — Instruct / Chat models
-export OLMOE_INSTRUCT_MODEL="${MODEL_CACHE}/models--allenai--OLMoE-1B-7B-0125-Instruct/snapshots/b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e"
+export OLMOE_INSTRUCT_MODEL="${MODEL_CACHE}/models--allenai--OLMoE-1B-7B-0125-Instruct/snapshots/b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e"  # ✅ 已下载
 export QWEN3_MOE_MODEL="${MODEL_CACHE}/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
 export QWEN3_MOE_INSTRUCT_MODEL="${MODEL_CACHE}/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe"
 
@@ -75,7 +75,7 @@ export DGO_SCRIPTS="${DGO_ROOT}/scripts"
 export DGO_DATASETS="${DGO_ROOT}/datasets"
 
 # 输出路径配置（换服务器时只需改此处）
-export DGO_STORAGE="/wutailin/DGO"
+export DGO_STORAGE="/usr/storage/fwan/DGO"
 export DGO_OUTPUTS="${DGO_STORAGE}/outputs"
 export DGO_LOGS="${DGO_STORAGE}/logs"
 export DGO_CACHE="${DGO_STORAGE}/dgo_cache"
@@ -100,8 +100,8 @@ export MBPP_HF="google-research-datasets/mbpp"
 
 # 本地数据集路径
 export MBPP_LOCAL="${DGO_DATASETS}/mbpp_json/train.json"
-export BIGMATH_LOCAL="/wutailin/BigMath/bigmath_uniform_train_10k.json"
-export BIGMATH_LOCAL_TEST="/wutailin/BigMath/bigmath_uniform_test_1k.json"
+export BIGMATH_LOCAL="${DGO_ROOT}/BigMath/bigmath_uniform_train_10k.json"
+export BIGMATH_LOCAL_TEST="${DGO_ROOT}/BigMath/bigmath_uniform_test_1k.json"
 
 # 数据集名称到路径的映射函数
 get_dataset_path() {
@@ -125,8 +125,8 @@ export MASTER_PORT="${MASTER_PORT:-$((29500 + RANDOM % 100))}"
 # =============================================================================
 # Conda 环境
 # =============================================================================
-export DGO_CONDA_ENV="/ouyangzhuoli2/conda/DGO"
-export CONDA_BASE="/opt/conda"
+export DGO_CONDA_ENV="/opt/miniforge3/envs/DGO"
+export CONDA_BASE="/opt/miniforge3"
 
 # 激活 conda 环境的函数
 activate_dgo_env() {
@@ -141,17 +141,10 @@ activate_dgo_env() {
 # =============================================================================
 # 系统提示（System Prompts）
 # =============================================================================
-# GRPO/DGO 用：带 <thinking> 推理链，<answer>\boxed{ANSWER}</answer> 给最终答案
-export MATH_SYSTEM_PROMPT="You are an expert mathematical problem solver. Think step by step, showing all your reasoning inside <thinking> tags. Then give your final answer as \\boxed{ANSWER} inside <answer> tags.
-
-Format your response exactly like this:
-<thinking>
-[your step-by-step reasoning]
-</thinking>
-<answer>\\boxed{ANSWER}</answer>"
-
-# SFT 用：不要求 <thinking>（SFT 数据无推理链），只要求 <answer>\boxed{ANSWER}</answer>
-export MATH_SFT_SYSTEM_PROMPT="You are an expert mathematical problem solver. Give your final answer as \\boxed{ANSWER} inside <answer> tags.
+# 统一的数学 system prompt（SFT / GRPO / DGO / eval / 数据生成共用）
+# 研究约束：no-CoT —— 模型直接输出答案，不允许思考链
+# 仅要求最终答案用 <answer>\boxed{ANSWER}</answer>，不展示推理过程
+export MATH_SYSTEM_PROMPT="You are an expert mathematical problem solver. Give your final answer as \\boxed{ANSWER} inside <answer> tags.
 
 Format your response exactly like this:
 <answer>\\boxed{ANSWER}</answer>"
@@ -159,23 +152,13 @@ Format your response exactly like this:
 # 代码任务：MBPP
 export CODE_SYSTEM_PROMPT="You are an expert Python programmer. Write clean, correct, and efficient Python code to solve the given problem."
 
-# GRPO/DGO 用（带 thinking）
+# 统一的 system prompt 分发函数（所有训练/评测/生成路径都用这个）
 get_system_prompt() {
     local dataset_key="$1"
     case "$dataset_key" in
         gsm8k|math|bigmath) echo "$MATH_SYSTEM_PROMPT" ;;
         mbpp)               echo "$CODE_SYSTEM_PROMPT" ;;
         *)                  echo "$MATH_SYSTEM_PROMPT" ;;
-    esac
-}
-
-# SFT 用（不带 thinking）
-get_sft_system_prompt() {
-    local dataset_key="$1"
-    case "$dataset_key" in
-        gsm8k|math|bigmath) echo "$MATH_SFT_SYSTEM_PROMPT" ;;
-        mbpp)               echo "$CODE_SYSTEM_PROMPT" ;;
-        *)                  echo "$MATH_SFT_SYSTEM_PROMPT" ;;
     esac
 }
 

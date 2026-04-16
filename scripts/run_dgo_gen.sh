@@ -46,6 +46,16 @@ export PYTHONUNBUFFERED=1
 # 禁用FlashInfer sampler
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
+# 使用 vLLM v1 engine（默认）；enforce_eager=True 已在 vllm_inference.py 中禁用 CUDA graph
+# 注：VLLM_USE_V1=0 在 vLLM 0.11.0 中会导致路由冲突（V1 engine 检测到 envs.VLLM_USE_V1=False 就崩溃）
+export VLLM_USE_V1=1
+
+# 禁用 custom all_reduce（GPU 间无 NVLink/P2P 时会报 invalid argument）
+export VLLM_USE_CUSTOM_ALL_REDUCE=0
+
+# 修复 libstdc++ 版本问题（系统库太旧，用 conda 环境里的新版本）
+export LD_PRELOAD="/opt/miniforge3/envs/DGO/lib/libstdc++.so.6:${LD_PRELOAD}"
+
 # 创建必要目录
 ensure_dirs
 
@@ -145,6 +155,9 @@ VLLM_MEM="${VLLM_MEM_UTIL[$MODEL_KEY]}"
 MAX_LEN="${MAX_LENGTH[$DATASET_KEY]}"
 MAX_SEQS="${MAX_NUM_SEQS[$MODEL_KEY]}"
 MAX_TOKENS_BATCH="${MAX_BATCHED_TOKENS[$MODEL_KEY]}"
+
+# 从 env.sh 读取统一的 system prompt（SFT/GRPO/DGO/eval/gen 同源），避免与 vllm_inference.py 内的默认值漂移
+SYSTEM_PROMPT=$(get_system_prompt "$DATASET_KEY")
 
 # 输出配置
 OUTPUT_FILE="${DGO_CACHE}/dgo_data_${MODEL_KEY}_${DATASET_KEY}.json"
@@ -263,6 +276,7 @@ if [[ "$USE_DATA_PARALLEL" == "true" && "$NUM_GPUS" -gt 1 ]]; then
             --output_file "$SHARD_FILE" \
             --shard_id "$i" \
             --num_shards "$NUM_GPUS" \
+            --system_prompt "$SYSTEM_PROMPT" \
             --stop '</answer>' \
             --stop $'\nQ:' \
             --stop $'\n\nQ:' &
@@ -348,6 +362,7 @@ else
         --max_num_batched_tokens "$MAX_TOKENS_BATCH" \
         --swap_space "$SWAP_SPACE" \
         --output_file "$OUTPUT_FILE" \
+        --system_prompt "$SYSTEM_PROMPT" \
         --stop '</answer>' \
         --stop $'\nQ:' \
         --stop $'\n\nQ:'

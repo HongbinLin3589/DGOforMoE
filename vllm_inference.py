@@ -39,12 +39,13 @@ from datasets_config import DatasetLoader, SYSTEM_PROMPTS, EXTRACT_ANSWER_FUNCS,
 # 数据集特定的 prompt 格式
 # =================================================================================
 
+# 统一的数学 system prompt（与 scripts/env.sh 的 MATH_SYSTEM_PROMPT 保持一致）
+# 研究约束：no-CoT —— SFT / GRPO / DGO / eval / 数据生成共用此 prompt
+# 仅要求最终答案用 <answer>\boxed{ANSWER}</answer>，不允许展示推理过程
 _MATH_SYSTEM = (
-    "You are an expert mathematical problem solver. Think step by step, showing all your "
-    "reasoning inside <thinking> tags. Then give your final answer as \\boxed{ANSWER} inside "
-    "<answer> tags.\n\n"
+    "You are an expert mathematical problem solver. Give your final answer as \\boxed{ANSWER} "
+    "inside <answer> tags.\n\n"
     "Format your response exactly like this:\n"
-    "<thinking>\n[your step-by-step reasoning]\n</thinking>\n"
     "<answer>\\boxed{ANSWER}</answer>"
 )
 
@@ -55,15 +56,13 @@ SYSTEM_PROMPTS_CUSTOM = {
     "mbpp": "You are an expert Python programmer. Write clean, efficient, and correct Python code to solve the given problem."
 }
 
-XML_COT_FORMAT = "<thinking>\n{reasoning}\n</thinking>\n<answer>\n{answer}\n</answer>"
+# no-CoT answer format: 只保留 <answer>\boxed{...}</answer>，不包含任何思考链
+ANSWER_ONLY_FORMAT = "<answer>\\boxed{{{answer}}}</answer>"
 
-# Few-shot examples for each dataset
+# Few-shot examples for each dataset (no-CoT: 只展示答案格式，不展示推理过程)
 _MATH_FEW_SHOT = {
     'question': 'What is the largest single-digit prime number?',
-    'assistant': XML_COT_FORMAT.format(
-        reasoning="9 is divisible by 3 and 8 is divisible by 2, but 7 is prime.",
-        answer="\\boxed{7}"
-    )
+    'assistant': '<answer>\\boxed{7}</answer>'
 }
 
 FEW_SHOT_EXAMPLES = {
@@ -71,8 +70,7 @@ FEW_SHOT_EXAMPLES = {
     "bigmath": _MATH_FEW_SHOT,
     "math": {
         'question': 'What is the value of 2 + 2?',
-        # 使用<answer>标签格式，与GSM8K保持一致
-        'assistant': '<thinking>\nWe need to compute 2 + 2.\nThis is a simple addition: 2 + 2 = 4.\n</thinking>\n<answer>\n\\boxed{4}\n</answer>'
+        'assistant': '<answer>\\boxed{4}</answer>'
     },
     "mbpp": {
         'question': 'Write a function to return the sum of two numbers.',
@@ -234,6 +232,8 @@ def main(args):
         max_num_batched_tokens=args.max_num_batched_tokens,  # 每批最大token数
         swap_space=args.swap_space,  # CPU swap空间(GB)，用于更大batch
         dtype="bfloat16",  # 使用bf16节省显存
+        # 稳定性：禁用 CUDA graphs（MoE TP 模式下 graph capture 容易崩溃）
+        enforce_eager=True,
         # LoRA 配置
         enable_lora=use_lora,
         max_lora_rank=args.max_lora_rank if use_lora else None,
@@ -253,7 +253,7 @@ def main(args):
     print(f"正在加载数据集: {args.dataset}, split={args.dataset_split}")
     try:
         dataset = load_dataset_by_type(args.dataset, split=args.dataset_split)
-        dataset = preprocess_dataset(args.dataset, dataset)
+        dataset = preprocess_dataset(args.dataset, dataset, system_prompt=args.system_prompt)
     except Exception as e:
         print(f"❌ 加载数据集失败: {e}")
         return
@@ -364,6 +364,9 @@ if __name__ == "__main__":
                         help="LoRA最大rank。默认64。")
 
     # Data Parallel 分片参数
+    parser.add_argument("--system_prompt", type=str, default=None,
+                        help="自定义 system prompt。默认使用统一的 no-CoT prompt（仅 <answer>\\boxed{} 格式）。"
+                             "SFT/GRPO/DGO/eval 共用此 prompt；研究约束是不允许 CoT。")
     parser.add_argument("--shard_id", type=int, default=None,
                         help="当前分片ID (0-indexed)。与 --num_shards 配合实现数据并行。")
     parser.add_argument("--num_shards", type=int, default=None,

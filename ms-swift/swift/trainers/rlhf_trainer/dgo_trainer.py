@@ -100,8 +100,15 @@ class DGOTrainer(SwiftMixin, Trainer):
         template = kwargs.get('template')
         if template is not None:
             self.processing_class = template.tokenizer
+            self.template = template
+            # Extract system prompt from template (try common attribute names)
+            self._system = (getattr(template, 'system', None) or
+                            getattr(template, 'default_system', None) or
+                            getattr(template, 'system_prompt', None))
         else:
             self.processing_class = kwargs.get('processing_class') or kwargs.get('tokenizer')
+            self.template = None
+            self._system = None
         if self.processing_class is None:
             raise ValueError("Must provide 'template' with tokenizer, or 'processing_class'/'tokenizer'")
 
@@ -257,7 +264,13 @@ class DGOTrainer(SwiftMixin, Trainer):
                                 completions,
                                 [ground_truth] * len(completions)
                             )
-                            weights = compute_dgo_weights(rewards, self.dgo_beta).tolist()
+                            # Zero-out weights when all rewards are 0 (no useful signal).
+                            # Keeps the sample in the dataset (steps stay aligned with GRPO)
+                            # but contributes zero gradient, matching GRPO's zero-advantage case.
+                            if all(r == 0 for r in rewards.tolist()):
+                                weights = [0.0] * len(completions)
+                            else:
+                                weights = compute_dgo_weights(rewards, self.dgo_beta).tolist()
                         else:
                             # Default: uniform weights
                             weights = [1.0] * len(completions)
@@ -331,15 +344,39 @@ class DGOTrainer(SwiftMixin, Trainer):
         Returns:
             Dict with {'input_ids', 'attention_mask', 'labels', 'weights'}
         """
-        # Concatenate prompt + response (avoid duplicate EOS token)
+        import re as _re
         eos_token = self.processing_class.eos_token
         texts = []
+        prompt_texts = []
+
         for f in features:
-            text = f['prompt'] + f['response']
-            # Only add EOS if not already present
+            # Build prompt text using chat template (aligns with SFT/GRPO training format)
+            prompt_text = None
+            if self.template is not None and hasattr(self.processing_class, 'apply_chat_template'):
+                # Extract just the question from the raw prompt.
+                # Raw format: "...few-shot...\nQ: <actual question>\nA:"
+                m = _re.search(r'\nQ: (.*?)\nA:\s*$', f['prompt'], _re.DOTALL)
+                question = m.group(1).strip() if m else f['prompt']
+                messages = []
+                if self._system:
+                    messages.append({'role': 'system', 'content': self._system})
+                messages.append({'role': 'user', 'content': question})
+                try:
+                    prompt_text = self.processing_class.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                except Exception:
+                    prompt_text = None
+
+            if prompt_text is None:
+                prompt_text = f['prompt']  # fallback to raw format
+
+            text = prompt_text + f['response']
             if eos_token and not text.endswith(eos_token):
                 text += eos_token
             texts.append(text)
+            prompt_texts.append(prompt_text)
+
         weights = torch.tensor([f['weight'] for f in features], dtype=torch.float32)
 
         # Tokenize
@@ -355,10 +392,9 @@ class DGOTrainer(SwiftMixin, Trainer):
         labels = tokenized['input_ids'].clone()
 
         # Mask prompt tokens (set to -100)
-        for i, feature in enumerate(features):
-            # Tokenize prompt separately to get its length
+        for i, prompt_text in enumerate(prompt_texts):
             prompt_tokens = self.processing_class(
-                feature['prompt'],
+                prompt_text,
                 add_special_tokens=False,
                 truncation=True,
                 max_length=self.max_length

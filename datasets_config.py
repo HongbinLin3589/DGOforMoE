@@ -75,12 +75,12 @@ DATASET_CONFIGS = {
     },
 }
 
+# 统一的数学 system prompt（与 scripts/env.sh 的 MATH_SYSTEM_PROMPT 保持一致）
+# 研究约束：no-CoT —— 模型直接输出答案，不允许思考链
 _MATH_SYSTEM_PROMPT = (
-    "You are an expert mathematical problem solver. Think step by step, showing all your "
-    "reasoning inside <thinking> tags. Then give your final answer as \\boxed{ANSWER} inside "
-    "<answer> tags.\n\n"
+    "You are an expert mathematical problem solver. Give your final answer as \\boxed{ANSWER} "
+    "inside <answer> tags.\n\n"
     "Format your response exactly like this:\n"
-    "<thinking>\n[your step-by-step reasoning]\n</thinking>\n"
     "<answer>\\boxed{ANSWER}</answer>"
 )
 
